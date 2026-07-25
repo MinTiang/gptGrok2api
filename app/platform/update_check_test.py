@@ -45,6 +45,16 @@ class UpdateCheckTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(update_check._success_cache_ttl(payload), update_check._ERROR_TTL_SECONDS)
 
+    def test_success_cache_uses_short_ttl_for_repository_version_fallback(self):
+        payload = {
+            "current_version": "1.2.0",
+            "latest_version": "1.2.0",
+            "changelog": "# Changelog\n\n## 1.2.0 - 2026-07-25\n",
+            "release_pending": True,
+        }
+
+        self.assertEqual(update_check._success_cache_ttl(payload), update_check._ERROR_TTL_SECONDS)
+
     def test_success_cache_uses_short_ttl_for_unreleased_changelog(self):
         payload = {
             "current_version": "1.0.4",
@@ -76,11 +86,44 @@ class UpdateCheckTest(unittest.IsolatedAsyncioTestCase):
             update_check,
             "_fetch_github_changelog",
             new=AsyncMock(return_value="# Changelog"),
+        ), patch.object(
+            update_check,
+            "_fetch_github_version",
+            new=AsyncMock(return_value="1.0.3"),
         ):
             release = await update_check._fetch_latest_release()
 
         self.assertEqual(release["tag_name"], "v1.0.3")
         self.assertEqual(release["changelog"], "# Changelog")
+
+    async def test_fetch_latest_release_falls_back_to_repository_version(self):
+        releases = [
+            {
+                "tag_name": "v1.1.0",
+                "name": "v1.1.0",
+                "draft": False,
+                "html_url": "https://github.com/AuuCoder/gptGrok2api/releases/tag/v1.1.0",
+            }
+        ]
+        with patch.object(
+            update_check,
+            "_fetch_github_releases",
+            new=AsyncMock(return_value=releases),
+        ), patch.object(
+            update_check,
+            "_fetch_github_changelog",
+            new=AsyncMock(return_value="# Changelog\n\n## 1.2.0"),
+        ), patch.object(
+            update_check,
+            "_fetch_github_version",
+            new=AsyncMock(return_value="1.2.0"),
+        ):
+            release = await update_check._fetch_latest_release()
+
+        self.assertEqual(release["tag_name"], "v1.2.0")
+        self.assertEqual(release["html_url"], update_check._RELEASE_PAGE_URL)
+        self.assertTrue(release["release_pending"])
+        self.assertEqual(release["changelog"], "# Changelog\n\n## 1.2.0")
 
 
 if __name__ == "__main__":

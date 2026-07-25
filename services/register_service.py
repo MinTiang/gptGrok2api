@@ -297,9 +297,21 @@ def _grok_oauth_display_status(value: object) -> str:
         return "normal"
     if probe_status == "limited":
         return "limited"
-    if probe_status in {"invalid", "unknown"}:
+    if probe_status == "invalid":
         return "invalid"
+    if probe_status == "unknown":
+        return "unknown"
     return "normal" if status == "active" else "invalid"
+
+
+def _grok_oauth_probe_recoverable(value: object) -> bool:
+    probe = value if isinstance(value, dict) else {}
+    if _clean_text(probe.get("status")).lower() != "invalid":
+        return False
+    code = _clean_text(probe.get("code")).lower()
+    return code != "permission-denied" and not (
+        code == "personal-team-blocked" or code.startswith("personal-team-blocked:")
+    )
 
 
 def _grok_oauth_authorizable(item: object) -> bool:
@@ -1548,7 +1560,7 @@ class RegisterService:
             if oauth_status == "denied":
                 authorization = item.get("oauth_authorization") if isinstance(item.get("oauth_authorization"), dict) else {}
                 return not isinstance(item.get("oauth"), dict) and _clean_text(authorization.get("status")).lower() == "denied"
-            if oauth_status in {"unauthorized", "normal", "limited", "no_quota", "expired", "invalid"}:
+            if oauth_status in {"unauthorized", "normal", "limited", "no_quota", "expired", "invalid", "unknown"}:
                 if oauth_status == "unauthorized":
                     return _grok_oauth_authorizable(item) and not isinstance(item.get("oauth"), dict)
                 return _grok_oauth_display_status(item.get("oauth")) == oauth_status
@@ -1689,7 +1701,7 @@ class RegisterService:
             "oauth_linked": sum(1 for item in merged_items if isinstance(item.get("oauth"), dict)),
             "oauth_status": {
                 status: sum(1 for value in oauth_display_statuses if value == status)
-                for status in ("unauthorized", "denied", "normal", "limited", "no_quota", "expired", "invalid")
+                for status in ("unauthorized", "denied", "normal", "limited", "no_quota", "expired", "invalid", "unknown")
             },
             "runtime_status": runtime_status,
             "calls_total": calls_total,
@@ -2272,7 +2284,7 @@ class RegisterService:
         if not oauth_account_id or _clean_text(oauth_item.get("status")).lower() == "disabled":
             return {"status": "deferred"}
         probe = oauth_item.get("probe") if isinstance(oauth_item.get("probe"), dict) else {}
-        if _clean_text(probe.get("status")).lower() != "invalid":
+        if not _grok_oauth_probe_recoverable(probe):
             return {"status": "deferred"}
 
         now = datetime.now(timezone.utc)
@@ -2375,14 +2387,26 @@ class RegisterService:
             return False
         return any(
             _clean_text(item.get("status")).lower() != "disabled"
-            and _clean_text(
-                item.get("probe", {}).get("status") if isinstance(item.get("probe"), dict) else ""
-            ).lower()
-            == "invalid"
+            and _grok_oauth_probe_recoverable(item.get("probe"))
             and _clean_text(
                 item.get("recovery", {}).get("status") if isinstance(item.get("recovery"), dict) else ""
             ).lower()
             in {"pending", "running"}
+            for item in items
+            if isinstance(item, dict)
+        )
+
+    @staticmethod
+    def _grok_oauth_has_due_invalid_recovery() -> bool:
+        try:
+            items = xai_cli_oauth_store.list_accounts(redacted=True)
+        except Exception:
+            return False
+        now = datetime.now(timezone.utc)
+        return any(
+            _clean_text(item.get("status")).lower() != "disabled"
+            and _grok_oauth_probe_recoverable(item.get("probe"))
+            and RegisterService._grok_oauth_recovery_due(item, now=now)
             for item in items
             if isinstance(item, dict)
         )
@@ -2421,6 +2445,19 @@ class RegisterService:
         except Exception:
             return False
         return bool(sources)
+
+    def handle_grok_oauth_probe_results(self, results: list[dict[str, Any]]) -> None:
+        has_invalid = any(
+            isinstance(item, dict)
+            and _grok_oauth_probe_recoverable(item)
+            for item in results
+        )
+        if not has_invalid:
+            return
+        with self._lock:
+            enabled = bool(self._grok_probe_config_locked().get("enabled"))
+        if enabled:
+            self._grok_probe_wake_event.set()
 
     def _queue_unlinked_grok_oauth_accounts(
         self,
@@ -2571,6 +2608,7 @@ class RegisterService:
                     recovery_sweep_due = (
                         recovery_sweep_due
                         or self._grok_oauth_has_inflight_recovery()
+                        or self._grok_oauth_has_due_invalid_recovery()
                         or self._grok_oauth_has_unlinked_accounts()
                     )
                     if recovery_sweep_due and not cycle_stop.is_set():
@@ -2582,6 +2620,12 @@ class RegisterService:
 
                 permission_retry = self._run_grok_permission_retry_once(cycle_stop)
                 if cycle_stop.is_set():
+                    continue
+                if self._grok_oauth_has_due_invalid_recovery():
+                    self._run_grok_oauth_recovery_sweep(
+                        include_backfill=False,
+                        stop_event=cycle_stop,
+                    )
                     continue
                 with self._lock:
                     probe = self._grok_probe_config_locked()
@@ -2709,6 +2753,7 @@ class RegisterService:
         *,
         limit: int | None = None,
         reclaim_inflight: bool = False,
+        include_backfill: bool = True,
         stop_event: Any | None = None,
     ) -> dict[str, int]:
         summary = {
@@ -2734,14 +2779,7 @@ class RegisterService:
                 item
                 for item in oauth_items
                 if _clean_text(item.get("status")).lower() != "disabled"
-                and _clean_text(
-                    item.get("probe", {}).get("status") if isinstance(item.get("probe"), dict) else ""
-                ).lower()
-                == "invalid"
-                and _clean_text(
-                    item.get("probe", {}).get("code") if isinstance(item.get("probe"), dict) else ""
-                ).lower()
-                != "permission-denied"
+                and _grok_oauth_probe_recoverable(item.get("probe"))
             ]
             candidates.sort(
                 key=lambda item: 0
@@ -2781,9 +2819,10 @@ class RegisterService:
                     summary["failed"] += 1
                 else:
                     summary["deferred"] += 1
-            backfill = self._queue_unlinked_grok_oauth_accounts(stop_event=stop_event)
-            for key, value in backfill.items():
-                summary[f"backfill_{key}"] = value
+            if include_backfill:
+                backfill = self._queue_unlinked_grok_oauth_accounts(stop_event=stop_event)
+                for key, value in backfill.items():
+                    summary[f"backfill_{key}"] = value
         except _GrokProbeCancelled:
             cancelled = True
         except Exception as error:
@@ -2996,7 +3035,7 @@ class RegisterService:
                         status = _clean_text(result.get("status")).lower() if isinstance(result, dict) else "unknown"
                         key = status if status in {"valid", "limited", "invalid", "unknown"} else "unknown"
                         summary[f"oauth_{key}"] += 1
-                        if status != "invalid" or not isinstance(result, dict):
+                        if not isinstance(result, dict) or not _grok_oauth_probe_recoverable(result):
                             continue
                         oauth_account_id = _clean_text(result.get("account_id"))
                         candidate = oauth_by_id.get(oauth_account_id)
@@ -3005,7 +3044,14 @@ class RegisterService:
                             continue
                         _raise_if_grok_probe_cancelled(stop_event)
                         recovery = self._recover_grok_oauth_account(
-                            {**candidate, "status": "invalid", "probe": {"status": "invalid"}},
+                            {
+                                **candidate,
+                                "status": "invalid",
+                                "probe": {
+                                    "status": "invalid",
+                                    "code": _clean_text(result.get("code")),
+                                },
+                            },
                             source_by_email,
                         )
                         recovery_status = _clean_text(recovery.get("status")).lower()
@@ -4203,3 +4249,4 @@ register_service = RegisterService(
 from services.xai_cli_oauth_service import xai_cli_oauth_service
 
 xai_cli_oauth_service.protocol_event_sink = register_service.handle_grok_oauth_protocol_event
+xai_cli_oauth_service.probe_event_sink = register_service.handle_grok_oauth_probe_results

@@ -256,6 +256,16 @@ class XaiCliOAuthService:
         self._protocol_queue_sequence = itertools.count()
         self._protocol_queue_workers: set[threading.Thread] = set()
         self.protocol_event_sink: Callable[[dict[str, Any]], None] | None = None
+        self.probe_event_sink: Callable[[list[dict[str, Any]]], None] | None = None
+
+    def _notify_probe_results(self, results: list[dict[str, Any]]) -> None:
+        sink = self.probe_event_sink
+        if sink is None:
+            return
+        try:
+            sink([dict(item) for item in results if isinstance(item, dict)])
+        except Exception:
+            pass
 
     def _client(self, *, proxy: str = "", timeout: float = 60.0) -> httpx.AsyncClient:
         kwargs: dict[str, Any] = {"timeout": httpx.Timeout(timeout, connect=min(timeout, 20.0))}
@@ -1317,6 +1327,8 @@ class XaiCliOAuthService:
                 if persist
                 else None
             )
+            if persist:
+                self._notify_probe_results([result])
             return result
 
         try:
@@ -1408,6 +1420,7 @@ class XaiCliOAuthService:
             for item in self.store.update_probe_results(results)
             if _clean_text(item.get("id"))
         }
+        self._notify_probe_results(results)
         summary = {"total": len(results), "valid": 0, "limited": 0, "invalid": 0, "unknown": 0}
         for result in results:
             result["account"] = saved_by_id.get(_clean_text(result.get("account_id")))

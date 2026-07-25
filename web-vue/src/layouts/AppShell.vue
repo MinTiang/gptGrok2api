@@ -586,7 +586,8 @@ const confirmDialog = useConfirmDialog()
 const isApiInfoOpen = ref(false)
 const isUpdateDialogOpen = ref(false)
 const isCheckingUpdate = ref(false)
-const currentVersionTag = ref(normalizeVersionTag(localVersion))
+const bundledVersionTag = normalizeVersionTag(localVersion)
+const currentVersionTag = ref(bundledVersionTag)
 const latestVersionTag = ref('')
 const releaseEntries = ref<ReleaseInfo[]>([])
 const updateCheckMessage = ref('')
@@ -839,6 +840,12 @@ let stopRoutePendingError: (() => void) | null = null
 const prefetchedRoutePaths = new Set<string>()
 const releasePageUrl = projectReleasePageUrl
 const updateCheckingMessage = '正在从 GitHub 检查版本...'
+
+function currentVersionCandidate(value: string) {
+  const apiVersionTag = normalizeVersionTag(value)
+  if (!apiVersionTag) return bundledVersionTag
+  return isNewerVersion(bundledVersionTag, apiVersionTag) ? bundledVersionTag : apiVersionTag
+}
 const routeViewLoaders: Record<string, () => Promise<unknown>> = {
   '/': () => import('@/views/Dashboard.vue'),
   '/accounts': () => import('@/views/Accounts.vue'),
@@ -966,7 +973,7 @@ async function checkForUpdates(showMessage = true) {
   try {
     const result = await versionApi.check(showMessage)
     if (result.check_error) throw new Error(result.check_error)
-    if (result.tag) currentVersionTag.value = result.tag
+    currentVersionTag.value = currentVersionCandidate(result.tag || result.version || '')
     if (!result.latest_tag && !result.latest_version) throw new Error('GitHub 未返回有效版本')
     latestVersionTag.value = normalizeVersionTag(result.latest_tag || result.latest_version)
     const remoteReleases = parseChangelog(result.changelog || '')
@@ -1004,12 +1011,12 @@ async function loadLocalReleaseEntries() {
 async function loadCurrentVersion() {
   try {
     const result = await versionApi.current()
-    currentVersionTag.value = String(result.tag || '').trim()
+    currentVersionTag.value = currentVersionCandidate(result.tag || result.version || '')
     if (!latestVersionTag.value) {
       latestVersionTag.value = normalizeVersionTag(releaseEntries.value[0]?.version || currentVersionTag.value)
     }
   } catch {
-    currentVersionTag.value = ''
+    currentVersionTag.value = bundledVersionTag
     if (!latestVersionTag.value) {
       latestVersionTag.value = normalizeVersionTag(releaseEntries.value[0]?.version || '')
     }

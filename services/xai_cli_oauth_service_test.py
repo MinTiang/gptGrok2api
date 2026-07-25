@@ -71,6 +71,31 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(service.initial_probe_delay_seconds, 5)
 
+    async def test_invalid_probe_notifies_recovery_sink_after_persisting(self) -> None:
+        account = self._account()
+        self.service.probe_event_sink = MagicMock()
+        rejected = httpx.Response(
+            401,
+            json={"error": {"code": "invalid_credentials", "message": "token rejected"}},
+        )
+
+        with patch.object(
+            self.service,
+            "_ensure_access_token",
+            new=AsyncMock(return_value=account),
+        ), patch.object(
+            self.service,
+            "_post_response",
+            new=AsyncMock(return_value=rejected),
+        ):
+            result = await self.service.probe_account(str(account["id"]))
+
+        self.assertEqual(result["status"], "invalid")
+        notified = self.service.probe_event_sink.call_args.args[0]
+        self.assertEqual(len(notified), 1)
+        self.assertEqual(notified[0]["status"], "invalid")
+        self.assertEqual(self.store.get(str(account["id"]))["probe"]["status"], "invalid")
+
     def test_billing_quota_rejects_unrelated_success_payload(self) -> None:
         self.assertEqual(_billing_quota(httpx.Response(200, json={"ok": True})), {})
 

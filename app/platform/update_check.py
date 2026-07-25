@@ -15,6 +15,7 @@ from app.platform.meta import get_project_version
 
 _GITHUB_RELEASES_API_URL = "https://api.github.com/repos/AuuCoder/gptGrok2api/releases?per_page=20"
 _GITHUB_CHANGELOG_URL = "https://raw.githubusercontent.com/AuuCoder/gptGrok2api/main/CHANGELOG.md"
+_GITHUB_VERSION_URL = "https://raw.githubusercontent.com/AuuCoder/gptGrok2api/main/VERSION"
 _RELEASE_PAGE_URL = "https://github.com/AuuCoder/gptGrok2api/releases"
 _CACHE_TTL_SECONDS = 86400.0
 _ERROR_TTL_SECONDS = 300.0
@@ -88,7 +89,7 @@ def _success_cache_ttl(payload: dict[str, Any]) -> float:
     current_version = str(payload.get("current_version") or "")
     latest_version = str(payload.get("latest_version") or "")
     changelog = str(payload.get("changelog") or "")
-    release_pending = _is_newer(current_version, latest_version)
+    release_pending = bool(payload.get("release_pending")) or _is_newer(current_version, latest_version)
     has_unreleased_notes = bool(re.search(r"^##\s+Unreleased\s*$", changelog, re.MULTILINE))
     if release_pending or has_unreleased_notes:
         return _ERROR_TTL_SECONDS
@@ -104,6 +105,7 @@ def _build_payload(release: dict[str, Any] | None = None, error: str = "") -> di
     published_at = str(release.get("published_at") or "").strip()
     release_notes = str(release.get("body") or "").strip()
     changelog = str(release.get("changelog") or "").strip()
+    release_pending = bool(release.get("release_pending"))
     has_remote = bool(release)
     return {
         "current_version": current_version,
@@ -113,6 +115,7 @@ def _build_payload(release: dict[str, Any] | None = None, error: str = "") -> di
         "published_at": published_at,
         "release_notes": release_notes,
         "changelog": changelog,
+        "release_pending": release_pending,
         "update_available": has_remote and bool(latest_version) and _is_newer(latest_version, current_version),
         "checked_at": _utc_now_iso(),
         "status": "error" if error else "ok",
@@ -152,16 +155,34 @@ async def _fetch_github_changelog(session: aiohttp.ClientSession) -> str:
     return await _fetch_github_text(session, _GITHUB_CHANGELOG_URL, "text/plain")
 
 
+async def _fetch_github_version(session: aiohttp.ClientSession) -> str:
+    version = _normalize_version(
+        await _fetch_github_text(session, _GITHUB_VERSION_URL, "text/plain")
+    )
+    if _parse_version(version) is None:
+        raise RuntimeError("GitHub VERSION returned an invalid version")
+    return version
+
+
 async def _fetch_latest_release() -> dict[str, Any]:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        releases, changelog = await asyncio.gather(
+        releases, changelog, repository_version = await asyncio.gather(
             _fetch_github_releases(session),
             _fetch_github_changelog(session),
+            _fetch_github_version(session),
         )
     latest = _select_latest_release(releases)
-    if latest is None:
-        raise RuntimeError("GitHub Releases returned no published version")
+    released_version = _normalize_version(
+        str((latest or {}).get("tag_name") or (latest or {}).get("name") or "")
+    )
+    if latest is None or _is_newer(repository_version, released_version):
+        latest = {
+            "tag_name": f"v{repository_version}",
+            "name": f"v{repository_version}",
+            "html_url": _RELEASE_PAGE_URL,
+            "release_pending": True,
+        }
     return {**latest, "changelog": changelog}
 
 

@@ -26,6 +26,7 @@ export type GrokAccountStatusFilter =
   | 'oauth_no_quota'
   | 'oauth_expired'
   | 'oauth_invalid'
+  | 'oauth_unknown'
 export type GrokAccountExportFormat = 'sub2api' | 'cpa'
 export type GrokAccountSyncState =
   | 'synced'
@@ -58,7 +59,7 @@ export type GrokAccountsSummary = {
   runtime_total?: number
   oauth_total?: number
   oauth_linked?: number
-  oauth_status?: Partial<Record<'unauthorized' | 'denied' | 'normal' | 'limited' | 'no_quota' | 'expired' | 'invalid', number>>
+  oauth_status?: Partial<Record<'unauthorized' | 'denied' | 'normal' | 'limited' | 'no_quota' | 'expired' | 'invalid' | 'unknown', number>>
   runtime_status?: Partial<Record<'active' | 'cooling' | 'invalid' | 'disabled', number>>
   calls_total?: number
   quota?: Partial<Record<GrokQuotaMode, number>>

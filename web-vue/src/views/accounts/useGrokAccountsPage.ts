@@ -48,6 +48,7 @@ export const grokAccountStatusFilterOptions = [
   { label: '无额度/无订阅', value: 'oauth_no_quota' },
   { label: 'OAuth 过期', value: 'oauth_expired' },
   { label: 'OAuth 失效', value: 'oauth_invalid' },
+  { label: 'OAuth 未确认', value: 'oauth_unknown' },
 ] as const satisfies ReadonlyArray<{ label: string; value: GrokAccountStatusFilter }>
 
 function exportFilename(format: GrokAccountExportFormat) {

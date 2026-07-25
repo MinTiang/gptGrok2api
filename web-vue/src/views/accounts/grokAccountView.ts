@@ -160,7 +160,7 @@ export function grokSyncStateText(item: GrokAccount): string {
   return '状态未知'
 }
 
-type GrokOAuthDisplayStatus = 'not_ready' | 'unauthorized' | 'denied' | 'normal' | 'limited' | 'no_quota' | 'expired' | 'invalid'
+type GrokOAuthDisplayStatus = 'not_ready' | 'unauthorized' | 'denied' | 'normal' | 'limited' | 'no_quota' | 'expired' | 'invalid' | 'unknown'
 
 function grokOAuthDisplayStatus(item: GrokAccount): GrokOAuthDisplayStatus {
   if (!item.oauth) {
@@ -175,7 +175,8 @@ function grokOAuthDisplayStatus(item: GrokAccount): GrokOAuthDisplayStatus {
   const probeStatus = cleanString(item.oauth?.probe?.status).toLowerCase()
   if (probeStatus === 'valid') return 'normal'
   if (probeStatus === 'limited') return 'limited'
-  if (probeStatus === 'invalid' || probeStatus === 'unknown') return 'invalid'
+  if (probeStatus === 'invalid') return 'invalid'
+  if (probeStatus === 'unknown') return 'unknown'
   return status === 'active' ? 'normal' : 'invalid'
 }
 
@@ -189,6 +190,7 @@ export function grokOAuthStatusText(item: GrokAccount): string {
     no_quota: '无额度/无订阅',
     expired: 'OAuth 过期',
     invalid: 'OAuth 失效',
+    unknown: 'OAuth 未确认',
   } as const)[grokOAuthDisplayStatus(item)]
 }
 
@@ -202,13 +204,14 @@ export function grokOAuthShortStatusText(item: GrokAccount): string {
     no_quota: '无额度/无订阅',
     expired: '过期',
     invalid: '失效',
+    unknown: '未确认',
   } as const)[grokOAuthDisplayStatus(item)]
 }
 
 export function grokOAuthStatusClass(item: GrokAccount): string {
   const status = grokOAuthDisplayStatus(item)
   if (status === 'normal') return PILL_TONE_CLASS.success
-  if (status === 'limited' || status === 'no_quota') return PILL_TONE_CLASS.warning
+  if (status === 'limited' || status === 'no_quota' || status === 'unknown') return PILL_TONE_CLASS.warning
   if (status === 'denied' || status === 'expired' || status === 'invalid') return PILL_TONE_CLASS.danger
   return PILL_TONE_CLASS.neutral
 }
