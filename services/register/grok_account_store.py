@@ -13,12 +13,14 @@ from typing import Any
 
 from services.config import DATA_DIR
 from services.json_file import read_json_file
+from services.xai_session_cookies import normalize_cookie_jar
 
 
 GROK_ACCOUNTS_FILE = DATA_DIR / "grok_accounts.json"
 _SECRET_PROFILE_KEYS = {
     "access_token",
     "cookies",
+    "oauth_cookie_jar",
     "password",
     "refresh_token",
     "sso",
@@ -214,6 +216,7 @@ class GrokAccountStore:
             if str(key).lower() not in _SECRET_PROFILE_KEYS
         }
         created_at = _clean_text(item.get("created_at")) or _now()
+        oauth_cookie_jar = normalize_cookie_jar(item.get("oauth_cookie_jar"))
         payload: dict[str, Any] = {
             "id": f"grok-{uuid.uuid4().hex}",
             "platform": "grok",
@@ -226,6 +229,8 @@ class GrokAccountStore:
             "created_at": created_at,
             "updated_at": _now(),
         }
+        if oauth_cookie_jar:
+            payload["oauth_cookie_jar"] = oauth_cookie_jar
         return payload
 
     def upsert(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -381,6 +386,7 @@ class GrokAccountStore:
                 "email": _mask_email(item.get("email")) if _clean_text(item.get("email")) else "",
                 "has_password": bool(_clean_text(item.get("password"))),
                 "has_sso": bool(_normalize_sso(item.get("sso"))),
+                "has_oauth_cookie_jar": bool(normalize_cookie_jar(item.get("oauth_cookie_jar"))),
                 "source_type": _clean_text(item.get("source_type")) or "protocol",
                 "status": _clean_text(item.get("status")) or "active",
                 "oauth_authorization": copy.deepcopy(item.get("oauth_authorization"))

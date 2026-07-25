@@ -10,6 +10,7 @@ import logging
 import os
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import cloakbrowser
 
@@ -446,6 +447,87 @@ async def _read_turnstile_state(page) -> tuple[str, str]:
     return str(state.get("token") or "").strip(), str(state.get("error") or "").strip()
 
 
+def _scoped_browser_cookies(cookies: list | None, page_url: str) -> list[dict]:
+    """Keep only cookies the target page could legitimately receive."""
+    target_host = (urlparse(str(page_url or "")).hostname or "").lower()
+    result = []
+    for raw in cookies or []:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        value = str(raw.get("value") or "").strip()
+        raw_domain = str(raw.get("domain") or target_host).strip().lower()
+        domain = raw_domain.lstrip(".")
+        if not name or not value or not domain:
+            continue
+        if target_host != domain and not target_host.endswith(f".{domain}"):
+            continue
+        item = {
+            "name": name,
+            "value": value,
+            "domain": f".{domain}" if raw_domain.startswith(".") else domain,
+            "path": str(raw.get("path") or "/"),
+            "secure": bool(raw.get("secure", True)),
+            "httpOnly": bool(raw.get("httpOnly", raw.get("http_only", False))),
+        }
+        same_site = str(raw.get("sameSite", raw.get("same_site", "")) or "").strip().capitalize()
+        if same_site in {"Strict", "Lax", "None"}:
+            item["sameSite"] = same_site
+        expires = raw.get("expires")
+        if isinstance(expires, (int, float)) and expires > time.time():
+            item["expires"] = float(expires)
+        result.append(item)
+    return result
+
+
+async def _browser_state(page) -> dict:
+    try:
+        state = await page.evaluate(
+            """async () => {
+              const uaData = navigator.userAgentData;
+              let high = {};
+              try {
+                if (uaData?.getHighEntropyValues) {
+                  high = await uaData.getHighEntropyValues([
+                    'architecture', 'bitness', 'fullVersionList', 'model',
+                    'platformVersion', 'uaFullVersion', 'wow64'
+                  ]);
+                }
+              } catch (_) {}
+              const brands = high.fullVersionList || uaData?.brands || [];
+              const secChUa = brands.map(item =>
+                `"${String(item.brand || '').replaceAll('"', '')}";v="${String(item.version || '')}"`
+              ).join(', ');
+              return {
+                user_agent: navigator.userAgent || '',
+                language: navigator.language || '',
+                languages: Array.from(navigator.languages || []),
+                timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+                client_hints: {
+                  sec_ch_ua: secChUa,
+                  sec_ch_ua_mobile: uaData?.mobile ? '?1' : '?0',
+                  sec_ch_ua_platform: `"${String(uaData?.platform || navigator.platform || '').replaceAll('"', '')}"`,
+                  architecture: high.architecture || '',
+                  bitness: high.bitness || '',
+                  platform_version: high.platformVersion || '',
+                  ua_full_version: high.uaFullVersion || ''
+                },
+                page_state: {
+                  url: location.origin + location.pathname + location.search,
+                  referrer: document.referrer || '',
+                  ready_state: document.readyState || '',
+                  visibility_state: document.visibilityState || '',
+                  viewport: {width: innerWidth, height: innerHeight},
+                  history_length: history.length
+                }
+              };
+            }"""
+        )
+    except Exception:
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
 async def _wait_for_turnstile_token(page, deadline: float,
                                     widget_state: dict = None) -> tuple[str, int, str]:
     """Poll callback/response fields and click only visible challenge frames."""
@@ -486,7 +568,8 @@ async def solve_turnstile_realpage(url: str, sitekey: str = None,
                                    action: str = None,
                                    cdata: str = None,
                                    concurrency: int = None,
-                                   queue_timeout_s: int = 60) -> dict:
+                                   queue_timeout_s: int = 60,
+                                   initial_cookies: list = None) -> dict:
     """Navigate a real page, execute pre_actions, click the CF Turnstile checkbox,
     return the token and browser cookies.
 
@@ -523,6 +606,9 @@ async def solve_turnstile_realpage(url: str, sitekey: str = None,
         async with await cloakbrowser.launch_async(**_browser_kwargs(proxy)) as browser:
             page = await browser.new_page(viewport={"width": 1280, "height": 900})
             try:
+                restored_cookies = _scoped_browser_cookies(initial_cookies, url)
+                if restored_cookies:
+                    await page.context.add_cookies(restored_cookies)
                 solve_started = time.monotonic()
                 deadline = solve_started + max(10, int(timeout_s)) - 2
                 remaining_ms = max(1000, min(45000, int((deadline - time.monotonic()) * 1000)))
@@ -533,26 +619,57 @@ async def solve_turnstile_realpage(url: str, sitekey: str = None,
                     await asyncio.sleep(2)
 
                 widget_state = {}
-                # Reuse a visible page widget first; otherwise inject one with a stable box.
-                if sitekey:
-                    widget_state = await _ensure_turnstile_widget(
-                        page, sitekey, deadline, action, cdata
-                    )
-                    log.info(
-                        "Real-page widget turnstile=%s frames=%d visible=%d "
-                        "reused=%s rebuilt=%s container=%s page=%s",
-                        bool(widget_state.get("turnstile")),
-                        int(widget_state.get("frame_count") or 0),
-                        int(widget_state.get("visible_frames") or 0),
-                        bool(widget_state.get("reused_existing")),
-                        bool(widget_state.get("rebuilt")),
-                        widget_state.get("container"),
-                        widget_state.get("page") or "unknown",
-                    )
+                route_fallback = False
+                token = ""
+                clicks = 0
+                challenge_error = ""
+                try:
+                    # Reuse a visible page widget first; otherwise inject one with a stable box.
+                    if sitekey:
+                        widget_state = await _ensure_turnstile_widget(
+                            page, sitekey, deadline, action, cdata
+                        )
+                        log.info(
+                            "Real-page widget turnstile=%s frames=%d visible=%d "
+                            "reused=%s rebuilt=%s container=%s page=%s",
+                            bool(widget_state.get("turnstile")),
+                            int(widget_state.get("frame_count") or 0),
+                            int(widget_state.get("visible_frames") or 0),
+                            bool(widget_state.get("reused_existing")),
+                            bool(widget_state.get("rebuilt")),
+                            widget_state.get("container"),
+                            widget_state.get("page") or "unknown",
+                        )
 
-                token, clicks, challenge_error = await _wait_for_turnstile_token(
-                    page, deadline, widget_state
-                )
+                    token, clicks, challenge_error = await _wait_for_turnstile_token(
+                        page, deadline, widget_state
+                    )
+                except Exception as error:
+                    # Next.js CSP can block dynamically injected api.js on the live sign-up
+                    # page. Keep the same context/cookies and solve on a same-origin route
+                    # interception instead of throwing away the browser identity.
+                    route_fallback = True
+                    challenge_error = str(error)[:240]
+                    div = (
+                        f'<div class="cf-turnstile" data-sitekey="{sitekey}"'
+                        + (f' data-action="{action}"' if action else "")
+                        + (f' data-cdata="{cdata}"' if cdata else "")
+                        + "></div>"
+                    )
+                    page_data = HTML_TEMPLATE.replace("<!-- cf turnstile -->", div)
+                    await page.route(
+                        route_glob(url),
+                        lambda route: route.fulfill(body=page_data, status=200),
+                    )
+                    remaining_ms = max(1_000, min(45_000, int((deadline - time.monotonic()) * 1000)))
+                    await page.goto(url, wait_until="domcontentloaded", timeout=remaining_ms)
+                    token = await _get_turnstile_response_route(page)
+                    widget_state = {
+                        "frame_count": 1,
+                        "visible_frames": 1,
+                        "rebuilt": True,
+                        "route_fallback": True,
+                    }
                 final_widget_state = await _read_widget_diagnostics(page)
                 _merge_widget_diagnostics(widget_state, final_widget_state)
                 log.info(
@@ -565,17 +682,20 @@ async def solve_turnstile_realpage(url: str, sitekey: str = None,
                 )
 
                 cookies = await page.context.cookies()
+                browser_state = await _browser_state(page)
                 result = {"token": token,
                           "verify_success": bool(token),
                           "cookies": cookies,
-                          "method": "real-page",
+                          "method": "real-page-route-fallback" if route_fallback else "real-page",
                           "elapsed": round(time.monotonic() - t0, 1),
                           "queue_wait": round(queue_wait, 1),
                           "concurrency": limit,
                           "clicks": clicks,
                           "widget_frames": int(widget_state.get("frame_count") or 0),
                           "widget_visible": int(widget_state.get("visible_frames") or 0),
-                          "widget_rebuilt": bool(widget_state.get("rebuilt"))}
+                          "widget_rebuilt": bool(widget_state.get("rebuilt")),
+                          "restored_cookies": len(restored_cookies),
+                          **browser_state}
                 if not token:
                     if not result["widget_visible"]:
                         result["phase"] = "widget"

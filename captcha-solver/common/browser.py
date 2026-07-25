@@ -44,6 +44,13 @@ def _rewrite_loopback_proxy(proxy: str) -> str:
     return urlunsplit((parts.scheme, f"{userinfo}{host}{port}", parts.path, parts.query, parts.fragment))
 
 
+def _playwright_proxy_url(proxy: str) -> str:
+    candidate = _rewrite_loopback_proxy(proxy)
+    if candidate.lower().startswith("socks5h://"):
+        return "socks5://" + candidate[len("socks5h://") :]
+    return candidate
+
+
 async def resolve_selector(page, selector: str, timeout: int = 10000):
     """Resolve a selector string to a Playwright locator.
 
@@ -102,8 +109,8 @@ async def run_pre_actions(page, actions: list):
 def browser_kwargs(prefix: str, proxy: str = None) -> dict:
     """Browser-trust levers, env-configurable per solver.
 
-    prefix is TURNSTILE | RECAPTCHA | HCAPTCHA. Turnstile defaults headless=1;
-    the interactive-checkbox solvers (recaptcha/hcaptcha) default headless=0.
+    prefix is TURNSTILE | RECAPTCHA | HCAPTCHA | XAI. Turnstile defaults
+    headless=1; interactive flows (recaptcha/hcaptcha/xAI) default headless=0.
     """
     default_headless = "1" if prefix == "TURNSTILE" else "0"
     headless = os.getenv(f"{prefix}_HEADLESS", default_headless) != "0"
@@ -113,7 +120,7 @@ def browser_kwargs(prefix: str, proxy: str = None) -> dict:
         kw["_suppress_maximize"] = True
     configured_proxy = str(proxy or os.getenv(f"{prefix}_PROXY") or "").strip()
     if configured_proxy:
-        kw["proxy"] = _rewrite_loopback_proxy(configured_proxy)
+        kw["proxy"] = _playwright_proxy_url(configured_proxy)
     if configured_proxy and os.getenv(f"{prefix}_GEOIP") == "1":
         kw["geoip"] = True
     return kw

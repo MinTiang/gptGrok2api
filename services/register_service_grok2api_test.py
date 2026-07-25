@@ -237,8 +237,134 @@ class RegisterServiceGrok2APITest(unittest.TestCase):
 
             text = service.get()["grok_oauth_logs"][-1]["text"]
             self.assertIn("complete-address@example.com", text)
+            self.assertIn("OAuth 未完成，无法执行 Grok 4.5 探测", text)
             saved = grok_store.get_accounts_by_ids([account["id"]])[0]
             self.assertEqual(saved["oauth_authorization"]["status"], "denied")
+
+    def test_protocol_probe_events_are_visible_in_registration_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+
+            service.handle_grok_oauth_protocol_event(
+                {
+                    "status": "probe_wait",
+                    "email": "probe@example.com",
+                    "delay_seconds": 5,
+                }
+            )
+            service.handle_grok_oauth_protocol_event(
+                {
+                    "status": "authorized",
+                    "email": "probe@example.com",
+                    "probe": {"status": "valid", "http_status": 200},
+                    "delivery": {},
+                }
+            )
+
+            logs = [item["text"] for item in service.get()["grok_oauth_logs"]]
+            self.assertIn("OAuth 凭据已获取，5 秒后直接探测 Grok 4.5：probe@example.com", logs)
+            self.assertIn("Grok 4.5 首次探测完成：probe@example.com，HTTP 200，状态 可用", logs)
+
+    def test_oauth_log_phase_clears_idle_history_and_preserves_active_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._append_grok_oauth_log("old phase")
+
+            with patch.object(service, "_grok_oauth_queue_busy", return_value=False):
+                service._begin_grok_oauth_log_phase("new phase")
+
+            idle_logs = service.get()["grok_oauth_logs"]
+            self.assertEqual(len(idle_logs), 1)
+            self.assertIn("new phase", idle_logs[0]["text"])
+            self.assertNotIn("old phase", idle_logs[0]["text"])
+
+            service._append_grok_oauth_log("active job")
+            with patch.object(service, "_grok_oauth_queue_busy", return_value=True):
+                service._begin_grok_oauth_log_phase("overlapping phase")
+
+            active_logs = service.get()["grok_oauth_logs"]
+            self.assertEqual(len(active_logs), 3)
+            self.assertIn("已保留正在执行的队列日志", active_logs[-1]["text"])
+
+    def test_new_grok_registration_starts_clean_oauth_log_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._config["total"] = 1
+            service._config["threads"] = 1
+            service._append_grok_oauth_log("previous registration")
+            backend = MagicMock()
+            backend.config = {"grok": {"xai_cli_oauth_enabled": False}}
+            backend.worker.return_value = {"ok": False, "error": "expected test failure"}
+
+            with patch.object(register_service_module, "_registration_backend", return_value=backend), patch.object(
+                service,
+                "_grok_oauth_queue_busy",
+                return_value=False,
+            ):
+                service.start()
+                service._runner.join(timeout=5)
+
+            logs = service.get()["grok_oauth_logs"]
+            self.assertEqual(len(logs), 1)
+            self.assertIn("Grok 注册任务：1 个 / 1 线程", logs[0]["text"])
+            self.assertNotIn("previous registration", logs[0]["text"])
+
+    def test_reset_clears_oauth_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._append_grok_oauth_log("finished phase")
+
+            service.reset()
+
+            self.assertEqual(service.get()["grok_oauth_logs"], [])
+
+    def test_live_oauth_access_denied_is_persisted_as_denied(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._grok_oauth_protocol_sink = MagicMock()
+            grok_store = GrokAccountStore(Path(temp_dir) / "grok_accounts.json")
+            account = grok_store.upsert(
+                {"email": "denied@example.com", "password": "password", "sso": "sso", "status": "active"}
+            )["item"]
+
+            with patch.object(register_service_module, "grok_account_store", grok_store):
+                service._enqueue_grok_oauth_protocol(
+                    {
+                        "item": account,
+                        "_oauth_live_error": "xAI Device Code token exchange failed: invalid_grant (Access denied)",
+                    }
+                )
+
+            saved = grok_store.get_accounts_by_ids([account["id"]])[0]
+            self.assertEqual(saved["oauth_authorization"]["status"], "denied")
+            service._grok_oauth_protocol_sink.assert_not_called()
+
+    def test_preauthorized_oauth_log_describes_validation_and_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._grok_oauth_protocol_sink = MagicMock(
+                return_value={"queued": True, "job": {"id": "validation-job"}}
+            )
+            grok_store = GrokAccountStore(Path(temp_dir) / "grok_accounts.json")
+            account = grok_store.upsert(
+                {"email": "ready@example.com", "password": "password", "sso": "sso", "status": "active"}
+            )["item"]
+            credential = {"access_token": "access", "refresh_token": "refresh"}
+
+            with patch.object(register_service_module, "grok_account_store", grok_store):
+                service._enqueue_grok_oauth_protocol(
+                    {"item": account, "_oauth_credential": credential}
+                )
+
+            log_text = service.get()["grok_oauth_logs"][-1]["text"]
+            self.assertIn("OAuth 凭据已进入验证与同步队列", log_text)
+            self.assertNotIn("即时上传", log_text)
+            service._grok_oauth_protocol_sink.assert_called_once_with(
+                account["id"],
+                prioritize=True,
+                session_cookies={},
+                preauthorized_credential=credential,
+            )
 
     def test_grok_probe_scheduler_respects_disabled_setting(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1009,20 +1135,23 @@ class RegisterServiceGrok2APITest(unittest.TestCase):
             client = FakeGrok2APIClient()
             upstream = httpx.Response(
                 200,
-                headers={
-                    "x-ratelimit-limit-requests": "21",
-                    "x-ratelimit-remaining-requests": "20",
-                    "x-ratelimit-limit-tokens": "1000000",
-                    "x-ratelimit-remaining-tokens": "999900",
-                },
                 json={"usage": {"input_tokens": 90, "output_tokens": 10, "total_tokens": 100}},
             )
+            billing_quota = {
+                "source": "billing",
+                "used_percent": 35,
+                "remaining_percent": 65,
+                "period": {"end": "2026-07-29T00:00:00+00:00"},
+            }
 
             with patch.object(register_service_module, "grok_account_store", grok_store), patch.object(
                 register_service_module, "xai_cli_oauth_store", oauth_store
             ), patch.object(service, "_grok2api_client", return_value=client), patch(
                 "services.xai_cli_oauth_service.XaiCliOAuthService._post_response",
                 new=AsyncMock(return_value=upstream),
+            ), patch(
+                "services.xai_cli_oauth_service.XaiCliOAuthService._fetch_billing_quota",
+                new=AsyncMock(return_value=billing_quota),
             ):
                 summary = service._run_grok_probe_once()
 
@@ -1033,7 +1162,8 @@ class RegisterServiceGrok2APITest(unittest.TestCase):
             saved = oauth_store.get(active["id"], redacted=True)
             self.assertEqual(saved["probe"]["status"], "valid")
             self.assertEqual(saved["probe"]["model"], "grok-4.5")
-            self.assertEqual(saved["quota"]["requests"]["remaining"], 20)
+            self.assertEqual(saved["quota"]["remaining_percent"], 65.0)
+            self.assertEqual(saved["quota"]["period"]["end"], "2026-07-29T00:00:00+00:00")
             self.assertEqual(saved["use_count"], 0)
             self.assertEqual(oauth_store.get(disabled["id"], redacted=True)["probe"], {})
 
@@ -1117,7 +1247,7 @@ class RegisterServiceGrok2APITest(unittest.TestCase):
                 http_status=403,
                 code="permission-denied",
                 error="permission pending",
-                probed_at=(now - timedelta(minutes=16)).isoformat(),
+                probed_at=(now - timedelta(seconds=61)).isoformat(),
             )
             oauth_store.update_probe_result(
                 recent["id"],
@@ -1126,7 +1256,7 @@ class RegisterServiceGrok2APITest(unittest.TestCase):
                 http_status=403,
                 code="permission-denied",
                 error="permission pending",
-                probed_at=(now - timedelta(minutes=14)).isoformat(),
+                probed_at=(now - timedelta(seconds=59)).isoformat(),
             )
             service = self._service(temp_dir)
             probe_accounts = AsyncMock(
@@ -1155,10 +1285,21 @@ class RegisterServiceGrok2APITest(unittest.TestCase):
             )
             probe_accounts.assert_awaited_once_with([old["id"]], concurrency=3)
             self.assertIn(
-                "恢复 1，待生效 0，其他失败 0，已上传 1",
+                "可用 1，仍在生效 0，其他失败 0，已同步 1",
                 service.get()["grok_oauth_logs"][-1]["text"],
             )
             self.assertEqual(service.get()["logs"], [])
+
+    def test_permission_retry_uses_60_120_300_second_backoff(self) -> None:
+        base = {"metadata": {"permission_retry": {"attempts": 0}}}
+
+        self.assertEqual(register_service_module._grok_permission_retry_delay_seconds(base), 60)
+        base["metadata"]["permission_retry"]["attempts"] = 1
+        self.assertEqual(register_service_module._grok_permission_retry_delay_seconds(base), 120)
+        base["metadata"]["permission_retry"]["attempts"] = 2
+        self.assertEqual(register_service_module._grok_permission_retry_delay_seconds(base), 300)
+        base["metadata"]["permission_retry"]["attempts"] = 99
+        self.assertEqual(register_service_module._grok_permission_retry_delay_seconds(base), 300)
 
     def test_scheduler_drains_due_permission_batches_without_idle_wait(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1280,7 +1421,8 @@ class RegisterServiceGrok2APITest(unittest.TestCase):
             )
 
             pending_log = service.get()["grok_oauth_logs"][-1]["text"]
-            self.assertIn("权限待生效，已进入延迟复检", pending_log)
+            self.assertIn("Grok 4.5 首次探测已执行", pending_log)
+            self.assertIn("权限正在生效，1 分钟后自动复检", pending_log)
             self.assertIn("pending@example.com", pending_log)
             self.assertEqual(service.get()["logs"], [])
 

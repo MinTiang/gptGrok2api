@@ -48,6 +48,7 @@ DEFAULT_GROK_PROBE_CONFIG = {
 }
 DEFAULT_GROK_CONFIG = {
     "signup_flow": "xconsole",
+    "browser_flow_enabled": True,
     "max_mail_retries": 3,
     "provider": "yescaptcha",
     "api_key": "",
@@ -88,7 +89,7 @@ _GROK_QUOTA_MODES = ("auto", "fast", "expert", "heavy", "console")
 _GROK_RECOVERY_BASE_DELAY_MINUTES = 60
 _GROK_RECOVERY_MAX_DELAY_MINUTES = 24 * 60
 _GROK_OAUTH_RECOVERY_STALE_MINUTES = 24 * 60
-_GROK_PERMISSION_RETRY_DELAY_SECONDS = 15 * 60
+_GROK_PERMISSION_RETRY_DELAYS_SECONDS = (60, 120, 300)
 _GROK_PERMISSION_RETRY_BATCH_SIZE = 3
 _GROK_PENDING_STATUSES = {
     "submitting",
@@ -102,6 +103,14 @@ _GROK_FAILED_STATUSES = {"submission_failed"}
 
 class _GrokProbeCancelled(RuntimeError):
     pass
+
+
+def _grok_permission_retry_delay_seconds(item: dict[str, Any]) -> int:
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    retry = metadata.get("permission_retry") if isinstance(metadata.get("permission_retry"), dict) else {}
+    attempts = max(0, _safe_int(retry.get("attempts")))
+    index = min(attempts, len(_GROK_PERMISSION_RETRY_DELAYS_SECONDS) - 1)
+    return _GROK_PERMISSION_RETRY_DELAYS_SECONDS[index]
 
 
 class _GrokProbeStopSignal:
@@ -599,6 +608,7 @@ def _normalize(raw: dict) -> dict:
     )
     signup_flow = str(grok.get("signup_flow") or "xconsole").strip().lower()
     grok["signup_flow"] = signup_flow if signup_flow in {"legacy", "xconsole"} else "xconsole"
+    grok["browser_flow_enabled"] = True
     for key in (
         "api_key",
         "api_base",
@@ -697,7 +707,13 @@ class RegisterService:
         openai_register.register_checkout_task_run_id = ""
         self._config = self._load()
         if self._config["enabled"]:
-            self.start()
+            # A persisted running flag only means the previous process exited
+            # mid-task. Resuming it on import can silently create new accounts
+            # from maintenance scripts or one-off workers.
+            self._config["enabled"] = False
+            self._config["stats"]["running"] = 0
+            self._config["stats"]["updated_at"] = _now()
+            self._save()
 
     def _load(self) -> dict:
         return _normalize(read_json_object(self._store_file, name="register.json"))
@@ -978,6 +994,10 @@ class RegisterService:
             metrics = self._pool_metrics() if target == "openai" else {"current_quota": 0, "current_available": 0}
             job_id = uuid.uuid4().hex
             started_at = _now()
+            if target == "grok":
+                self._begin_grok_oauth_log_phase(
+                    f"Grok 注册任务：{self._config['total']} 个 / {self._config['threads']} 线程"
+                )
             self._config["stats"] = {
                 "job_id": job_id,
                 "success": 0,
@@ -1117,6 +1137,7 @@ class RegisterService:
     def reset(self) -> dict:
         with self._lock:
             self._logs = []
+            self._grok_oauth_logs = []
             target = str(self._config.get("target") or "openai")
             metrics = self._pool_metrics() if target == "openai" else {"current_quota": 0, "current_available": 0}
             self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **metrics, "updated_at": _now()}
@@ -1409,6 +1430,7 @@ class RegisterService:
 
     def authorize_grok_accounts_oauth(self, ids: list[str]) -> dict[str, Any]:
         ordered_ids = list(dict.fromkeys(_clean_text(value) for value in ids if _clean_text(value)))
+        self._begin_grok_oauth_log_phase(f"Grok 手动 OAuth 授权：{len(ordered_ids)} 个账号")
         raw_items = grok_account_store.get_accounts_by_ids(ordered_ids)
         by_id = {_clean_text(item.get("id")): item for item in raw_items}
         linked_emails = {
@@ -2588,7 +2610,7 @@ class RegisterService:
         if stop_event is not None and stop_event.is_set():
             return summary
 
-        due_before = datetime.now(timezone.utc) - timedelta(seconds=_GROK_PERMISSION_RETRY_DELAY_SECONDS)
+        now = datetime.now(timezone.utc)
         candidates: list[dict[str, Any]] = []
         for item in xai_cli_oauth_store.list_accounts(redacted=False):
             if not isinstance(item, dict) or _clean_text(item.get("status")).lower() == "disabled":
@@ -2597,7 +2619,8 @@ class RegisterService:
             if _clean_text(probe.get("code")).lower() != "permission-denied":
                 continue
             probed_at = _parse_datetime(probe.get("at"))
-            if probed_at is None or probed_at > due_before:
+            retry_delay = _grok_permission_retry_delay_seconds(item)
+            if probed_at is None or probed_at > now - timedelta(seconds=retry_delay):
                 continue
             candidates.append(item)
         candidates.sort(
@@ -2632,13 +2655,43 @@ class RegisterService:
                 1 for item in results if _clean_text(item.get("code")).lower() == "permission-denied"
             )
             summary["failed"] = max(0, summary["tested"] - summary["valid"] - summary["pending"])
+            selected_by_id = {_clean_text(item.get("id")): item for item in selected}
+            retry_updated_at = _now()
+            for result in results:
+                account_id = _clean_text(result.get("account_id")) if isinstance(result, dict) else ""
+                source = selected_by_id.get(account_id)
+                if not account_id or not isinstance(source, dict):
+                    continue
+                metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
+                retry = metadata.get("permission_retry") if isinstance(metadata.get("permission_retry"), dict) else {}
+                status = _clean_text(result.get("status")).lower()
+                pending = _clean_text(result.get("code")).lower() == "permission-denied"
+                attempts = max(0, _safe_int(retry.get("attempts"))) + (1 if pending else 0)
+                next_delay = (
+                    _GROK_PERMISSION_RETRY_DELAYS_SECONDS[
+                        min(attempts, len(_GROK_PERMISSION_RETRY_DELAYS_SECONDS) - 1)
+                    ]
+                    if pending
+                    else 0
+                )
+                xai_cli_oauth_store.update_metadata(
+                    account_id,
+                    {
+                        "permission_retry": {
+                            "attempts": attempts if pending else 0,
+                            "last_status": "pending" if pending else status or "failed",
+                            "last_attempt_at": retry_updated_at,
+                            "next_delay_seconds": next_delay,
+                        }
+                    },
+                )
             result_summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
             summary["uploaded"] = max(0, _safe_int(result_summary.get("delivery_success")))
             level = "green" if summary["valid"] else "yellow"
             self._append_grok_oauth_log(
-                "Grok OAuth 权限延迟复检完成："
-                f"恢复 {summary['valid']}，待生效 {summary['pending']}，"
-                f"其他失败 {summary['failed']}，已上传 {summary['uploaded']}",
+                "Grok 4.5 权限复检完成："
+                f"可用 {summary['valid']}，仍在生效 {summary['pending']}，"
+                f"其他失败 {summary['failed']}，已同步 {summary['uploaded']}",
                 level,
             )
         except _GrokProbeCancelled:
@@ -2646,7 +2699,7 @@ class RegisterService:
         except Exception as error:
             summary["failed"] = len(selected)
             self._append_grok_oauth_log(
-                f"Grok OAuth 权限延迟复检失败：{self._grok2api_error_text(error)}",
+                f"Grok 4.5 权限复检失败：{self._grok2api_error_text(error)}",
                 "red",
             )
         return summary
@@ -3197,6 +3250,11 @@ class RegisterService:
             if isinstance(payload.get("oauth_session_cookies"), dict)
             else {}
         )
+        session_cookie_jar = (
+            list(payload.get("oauth_cookie_jar"))
+            if isinstance(payload.get("oauth_cookie_jar"), list)
+            else []
+        )
         oauth_credential = (
             dict(payload.get("oauth_credential"))
             if isinstance(payload.get("oauth_credential"), dict)
@@ -3208,6 +3266,8 @@ class RegisterService:
         saved = self._persist_grok_account_snapshot(persisted_payload)
         if session_cookies:
             saved["_oauth_session_cookies"] = session_cookies
+        if session_cookie_jar:
+            saved["_oauth_cookie_jar"] = session_cookie_jar
         if oauth_credential:
             saved["_oauth_credential"] = oauth_credential
         if oauth_live_error:
@@ -3229,6 +3289,13 @@ class RegisterService:
             if isinstance(saved.get("_oauth_session_cookies"), dict)
             else {}
         )
+        session_cookie_jar = (
+            list(saved.get("_oauth_cookie_jar"))
+            if isinstance(saved.get("_oauth_cookie_jar"), list)
+            else list(item.get("oauth_cookie_jar"))
+            if isinstance(item.get("oauth_cookie_jar"), list)
+            else []
+        )
         oauth_credential = (
             dict(saved.get("_oauth_credential"))
             if isinstance(saved.get("_oauth_credential"), dict)
@@ -3236,9 +3303,14 @@ class RegisterService:
         )
         oauth_live_error = _clean_text(saved.get("_oauth_live_error"))
         if oauth_live_error:
+            normalized_error = oauth_live_error.lower()
             grok_account_store.update_oauth_authorization_state(
                 account_id,
-                status="failed",
+                status=(
+                    "denied"
+                    if "invalid_grant" in normalized_error or "access denied" in normalized_error
+                    else "failed"
+                ),
                 attempted_at=_now(),
                 error=oauth_live_error,
             )
@@ -3252,6 +3324,8 @@ class RegisterService:
                 "prioritize": True,
                 "session_cookies": session_cookies,
             }
+            if session_cookie_jar:
+                start_kwargs["session_cookie_jar"] = session_cookie_jar
             if oauth_credential:
                 start_kwargs["preauthorized_credential"] = oauth_credential
             started = self._grok_oauth_protocol_sink(account_id, **start_kwargs)
@@ -3267,14 +3341,20 @@ class RegisterService:
             attempted_at=_now(),
             error="",
         )
-        if bool(started.get("reused")):
-            state = "已接入"
+        if oauth_credential and bool(started.get("reused")):
+            message = "Grok OAuth 凭据已接入验证与同步任务"
+        elif oauth_credential and bool(started.get("queued")):
+            message = "Grok OAuth 凭据已进入验证与同步队列"
+        elif oauth_credential:
+            message = "Grok OAuth 授权已启动（凭据验证与同步）"
+        elif bool(started.get("reused")):
+            message = "Grok OAuth 授权任务已接入"
         elif bool(started.get("queued")):
-            state = "已进入即时上传队列"
+            message = "Grok OAuth 授权任务已进入处理队列"
         else:
-            state = "已启动"
+            message = "Grok OAuth 授权已启动"
         self._append_grok_oauth_log(
-            f"Grok OAuth 授权{state}：{log_email}",
+            f"{message}：{log_email}",
             "yellow",
         )
 
@@ -3285,7 +3365,16 @@ class RegisterService:
         source_account_id = _clean_text(event.get("source_account_id"))
         recovery_account = xai_cli_oauth_store.find_by_recovery_job_id(job_id) if job_id else None
         recovery_account_id = _clean_text(recovery_account.get("id")) if isinstance(recovery_account, dict) else ""
-        if _clean_text(event.get("status")) == "permission_pending":
+        event_status = _clean_text(event.get("status"))
+        if event_status == "probe_wait":
+            delay_seconds = max(0, min(60, _safe_int(event.get("delay_seconds"))))
+            if delay_seconds:
+                message = f"OAuth 凭据已获取，{delay_seconds} 秒后直接探测 Grok 4.5"
+            else:
+                message = "OAuth 凭据已获取，正在直接探测 Grok 4.5"
+            self._append_grok_oauth_log(f"{message}：{log_email}", "yellow")
+            return
+        if event_status == "permission_pending":
             if source_account_id:
                 grok_account_store.update_oauth_authorization_state(
                     source_account_id,
@@ -3293,12 +3382,15 @@ class RegisterService:
                     attempted_at=_now(),
                     error="",
                 )
+            probe = event.get("probe") if isinstance(event.get("probe"), dict) else {}
+            http_status = max(0, _safe_int(probe.get("http_status")))
+            http_text = f"HTTP {http_status}，" if http_status else ""
             self._append_grok_oauth_log(
-                f"Grok OAuth 授权完成，Grok 4.5 权限待生效，已进入延迟复检：{log_email}",
+                f"Grok 4.5 首次探测已执行：{log_email}，{http_text}权限正在生效，1 分钟后自动复检",
                 "yellow",
             )
             return
-        if _clean_text(event.get("status")) != "authorized":
+        if event_status != "authorized":
             error = self._grok2api_error_text(RuntimeError(_clean_text(event.get("error")) or "未知错误"))
             if recovery_account_id:
                 recovery = (
@@ -3327,8 +3419,13 @@ class RegisterService:
                         attempted_at=_now(),
                         error=error,
                     )
+                probe_note = (
+                    "；OAuth 未完成，无法执行 Grok 4.5 探测"
+                    if not bool(event.get("credential_acquired"))
+                    else "；OAuth 凭据验证或 Grok 4.5 探测未通过"
+                )
                 self._append_grok_oauth_log(
-                    f"Grok OAuth 协议授权失败：{log_email}，原因: {error}",
+                    f"Grok OAuth 协议授权失败：{log_email}，原因: {error}{probe_note}",
                     "red",
                 )
             return
@@ -3351,6 +3448,23 @@ class RegisterService:
                 next_attempt_at="",
                 attempts=0,
                 error="",
+            )
+
+        probe = event.get("probe") if isinstance(event.get("probe"), dict) else {}
+        probe_status = _clean_text(probe.get("status")).lower()
+        http_status = max(0, _safe_int(probe.get("http_status")))
+        if probe:
+            status_text = {
+                "valid": "可用",
+                "limited": "限流",
+                "invalid": "失效",
+                "unknown": "未知",
+            }.get(probe_status, probe_status or "未知")
+            http_text = f"HTTP {http_status}，" if http_status else ""
+            level = "green" if probe_status == "valid" else "yellow"
+            self._append_grok_oauth_log(
+                f"Grok 4.5 首次探测完成：{log_email}，{http_text}状态 {status_text}",
+                level,
             )
 
         delivery = event.get("delivery") if isinstance(event.get("delivery"), dict) else {}
@@ -3394,6 +3508,31 @@ class RegisterService:
     def _append_grok_oauth_log(self, text: str, color: str = "") -> None:
         with self._lock:
             self._grok_oauth_logs.append({"time": _now(), "text": str(text), "level": str(color or "info")})
+            self._grok_oauth_logs = self._grok_oauth_logs[-300:]
+
+    @staticmethod
+    def _grok_oauth_queue_busy() -> bool:
+        try:
+            from services.xai_cli_oauth_service import xai_cli_oauth_service
+
+            status = xai_cli_oauth_service.protocol_queue_status()
+        except Exception:
+            return False
+        return max(0, _safe_int(status.get("queued"))) + max(0, _safe_int(status.get("running"))) > 0
+
+    def _begin_grok_oauth_log_phase(self, label: str) -> None:
+        busy = self._grok_oauth_queue_busy()
+        with self._lock:
+            if not busy:
+                self._grok_oauth_logs = []
+            suffix = "（已保留正在执行的队列日志）" if busy else ""
+            self._grok_oauth_logs.append(
+                {
+                    "time": _now(),
+                    "text": f"OAuth 日志阶段：{_clean_text(label) or '未命名阶段'}{suffix}",
+                    "level": "info",
+                }
+            )
             self._grok_oauth_logs = self._grok_oauth_logs[-300:]
 
     def _append_checkout_log(self, text: str, color: str = "") -> None:
@@ -4041,6 +4180,7 @@ def _start_xai_cli_oauth_protocol(
     prioritize: bool = False,
     retry: bool = False,
     session_cookies: dict[str, str] | None = None,
+    session_cookie_jar: list[dict[str, Any]] | None = None,
     preauthorized_credential: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from services.xai_cli_oauth_service import xai_cli_oauth_service
@@ -4050,6 +4190,7 @@ def _start_xai_cli_oauth_protocol(
         prioritize=prioritize,
         retry=retry,
         session_cookies=session_cookies,
+        session_cookie_jar=session_cookie_jar,
         preauthorized_credential=preauthorized_credential,
     )
 

@@ -8,6 +8,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+try:
+    from services.xai_session_cookies import apply_cookie_jar, flatten_cookie_jar, normalize_cookie_jar
+except ModuleNotFoundError:  # Direct execution places services/ on sys.path.
+    from xai_session_cookies import apply_cookie_jar, flatten_cookie_jar, normalize_cookie_jar
+
 
 RESULT_PREFIX = "XAI_PKCE_RESULT="
 
@@ -27,6 +32,7 @@ def main() -> int:
     from xconsole_client.oauth_protocol import ProtocolOAuthClient
 
     sso = str(payload.get("sso") or "").strip()
+    session_cookie_jar = normalize_cookie_jar(payload.get("session_cookie_jar"))
     session_cookies = (
         {
             str(name): str(value)
@@ -36,6 +42,7 @@ def main() -> int:
         if isinstance(payload.get("session_cookies"), dict)
         else {}
     )
+    session_cookies = {**flatten_cookie_jar(session_cookie_jar), **session_cookies}
     if sso:
         session_cookies.setdefault("sso", sso)
         session_cookies.setdefault("sso-rw", sso)
@@ -46,6 +53,7 @@ def main() -> int:
         impersonate=impersonate,
         debug=False,
     )
+    apply_cookie_jar(client._s, session_cookie_jar)
     with tempfile.TemporaryDirectory(prefix="xai-pkce-auth-") as auth_dir:
         result = client.login(
             str(payload.get("email") or "").strip(),

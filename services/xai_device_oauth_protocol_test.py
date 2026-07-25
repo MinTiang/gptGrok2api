@@ -144,10 +144,6 @@ class DeviceConsentFormTest(unittest.TestCase):
                 headers={"location": "https://accounts.x.ai/oauth2/device/consent?user_code=ABCD-EFGH"},
             ),
             response(
-                url="https://accounts.x.ai/oauth2/device/consent?user_code=ABCD-EFGH",
-                text=self.HTML,
-            ),
-            response(
                 status=302,
                 url="https://auth.x.ai/oauth2/device/approve",
                 headers={"location": "https://accounts.x.ai/oauth2/device/done"},
@@ -177,6 +173,186 @@ class DeviceConsentFormTest(unittest.TestCase):
         client.create_castle_token.assert_not_called()
         solver_type.assert_not_called()
         self.assertNotIn("saved-sso-token", repr(client._request.call_args_list))
+        self.assertEqual(client._request.call_args_list[2].args[:2], ("POST", "https://auth.x.ai/oauth2/device/approve"))
+        self.assertEqual(
+            client._request.call_args_list[2].kwargs["data"],
+            {
+                "user_code": "ABCD-EFGH",
+                "action": "allow",
+                "principal_type": "User",
+                "principal_id": "",
+            },
+        )
+
+    def test_verify_redirect_to_done_skips_approve(self) -> None:
+        def response(*, status: int = 200, url: str = "", headers=None, payload=None, text: str = ""):
+            item = MagicMock()
+            item.status_code = status
+            item.url = url
+            item.headers = headers or {}
+            item.text = text
+            item.json.return_value = payload or {}
+            return item
+
+        client = MagicMock()
+        client._request.side_effect = [
+            response(payload={"device_code": "device-code", "user_code": "ABCD-EFGH", "expires_in": 300}),
+            response(
+                status=302,
+                url="https://auth.x.ai/oauth2/device/verify",
+                headers={"location": "https://accounts.x.ai/oauth2/device/done"},
+            ),
+            response(payload={"access_token": "access-token", "refresh_token": "refresh-token"}),
+        ]
+
+        with patch("services.xai_device_oauth_protocol.GrokProtocolClient", return_value=client):
+            result = XaiDeviceOAuthProtocol({}, proxy="direct").authorize(
+                email="person@example.com",
+                password="",
+                sso="saved-sso-token",
+            )
+
+        self.assertEqual(result["access_token"], "access-token")
+        self.assertEqual(client._request.call_count, 3)
+        self.assertNotIn("/oauth2/device/approve", repr(client._request.call_args_list))
+
+    def test_direct_approval_reports_access_denied(self) -> None:
+        def response(*, status: int = 200, url: str = "", headers=None, payload=None):
+            item = MagicMock()
+            item.status_code = status
+            item.url = url
+            item.headers = headers or {}
+            item.text = ""
+            item.json.return_value = payload or {}
+            return item
+
+        client = MagicMock()
+        client._request.side_effect = [
+            response(
+                status=302,
+                url="https://auth.x.ai/oauth2/device/verify",
+                headers={"location": "https://accounts.x.ai/oauth2/device/consent"},
+            ),
+            response(
+                status=400,
+                url="https://auth.x.ai/oauth2/device/approve",
+                payload={"error": "access_denied"},
+            ),
+        ]
+
+        with self.assertRaisesRegex(XaiDeviceOAuthProtocolError, "access_denied") as raised:
+            XaiDeviceOAuthProtocol._approve_device_direct(client, "ABCD-EFGH", stage="sso")
+
+        self.assertEqual(raised.exception.stage, "approve")
+
+    def test_direct_verify_rejects_forbidden_session(self) -> None:
+        verify = MagicMock(status_code=403, url="https://auth.x.ai/oauth2/device/verify", headers={}, text="")
+        verify.json.return_value = {}
+        client = MagicMock()
+        client._request.return_value = verify
+
+        with self.assertRaisesRegex(XaiDeviceOAuthProtocolError, "rejected the login session") as raised:
+            XaiDeviceOAuthProtocol._approve_device_direct(client, "ABCD-EFGH", stage="sso")
+
+        self.assertEqual(raised.exception.stage, "sso")
+
+    def test_direct_approve_rejects_forbidden_session(self) -> None:
+        verify = MagicMock(
+            status_code=302,
+            url="https://auth.x.ai/oauth2/device/verify",
+            headers={"location": "https://accounts.x.ai/oauth2/device/consent"},
+            text="",
+        )
+        verify.json.return_value = {}
+        approve = MagicMock(status_code=403, url="https://auth.x.ai/oauth2/device/approve", headers={}, text="")
+        approve.json.return_value = {}
+        client = MagicMock()
+        client._request.side_effect = [verify, approve]
+
+        with self.assertRaisesRegex(XaiDeviceOAuthProtocolError, "rejected the device approval session") as raised:
+            XaiDeviceOAuthProtocol._approve_device_direct(client, "ABCD-EFGH", stage="sso")
+
+        self.assertEqual(raised.exception.stage, "approve")
+
+    def test_unsupported_direct_approve_falls_back_to_consent_form(self) -> None:
+        def response(*, status: int = 200, url: str = "", headers=None, payload=None, text: str = ""):
+            item = MagicMock()
+            item.status_code = status
+            item.url = url
+            item.headers = headers or {}
+            item.text = text
+            item.json.return_value = payload or {}
+            return item
+
+        consent_url = "https://accounts.x.ai/oauth2/device/consent?user_code=ABCD-EFGH"
+        client = MagicMock()
+        client._request.side_effect = [
+            response(payload={"device_code": "device-code", "user_code": "ABCD-EFGH", "expires_in": 300}),
+            response(
+                status=302,
+                url="https://auth.x.ai/oauth2/device/verify",
+                headers={"location": consent_url},
+            ),
+            response(status=405, url="https://auth.x.ai/oauth2/device/approve"),
+            response(url=consent_url, text=self.HTML),
+            response(
+                status=302,
+                url="https://auth.x.ai/oauth2/device/approve",
+                headers={"location": "https://accounts.x.ai/oauth2/device/done"},
+            ),
+            response(payload={"access_token": "access-token", "refresh_token": "refresh-token"}),
+        ]
+
+        with patch("services.xai_device_oauth_protocol.GrokProtocolClient", return_value=client):
+            result = XaiDeviceOAuthProtocol({}, proxy="direct").authorize(
+                email="person@example.com",
+                password="",
+                sso="saved-sso-token",
+            )
+
+        self.assertEqual(result["access_token"], "access-token")
+        self.assertEqual(client._request.call_args_list[3].args[:2], ("GET", consent_url))
+        self.assertEqual(client._request.call_count, 6)
+
+    def test_live_registration_browser_approves_device_before_token_poll(self) -> None:
+        def response(payload: dict):
+            item = MagicMock()
+            item.status_code = 200
+            item.json.return_value = payload
+            return item
+
+        client = MagicMock()
+        client._request.side_effect = [
+            response(
+                {
+                    "device_code": "device-code",
+                    "user_code": "ABCD-EFGH",
+                    "verification_uri": "https://accounts.x.ai/sign-in?redirect=device",
+                    "expires_in": 300,
+                    "interval": 1,
+                }
+            ),
+            response({"access_token": "access-token", "refresh_token": "refresh-token", "expires_in": 21600}),
+        ]
+        bridge = MagicMock(session_id="xai-live-session")
+        bridge.authorize_device.return_value = {"ok": True, "reason": "confirmed"}
+
+        with patch("services.xai_device_oauth_protocol.GrokProtocolClient", return_value=client):
+            result = XaiDeviceOAuthProtocol({}, proxy="direct").authorize_browser_session(
+                email="person@example.com",
+                sso="browser-sso",
+                browser_bridge=bridge,
+            )
+
+        self.assertEqual(result["access_token"], "access-token")
+        self.assertEqual(result["sso"], "browser-sso")
+        bridge.authorize_device.assert_called_once_with(
+            verification_url="https://accounts.x.ai/sign-in?redirect=device",
+            user_code="ABCD-EFGH",
+            timeout_s=180,
+        )
+        self.assertEqual(client._request.call_args_list[0].args[1], "https://auth.x.ai/oauth2/device/code")
+        self.assertEqual(client._request.call_args_list[1].args[1], "https://auth.x.ai/oauth2/token")
 
     def test_invalid_grant_is_retryable_with_a_fresh_device_code(self) -> None:
         def response(*, status: int = 200, url: str = "", headers=None, payload=None, text: str = ""):
@@ -195,10 +371,6 @@ class DeviceConsentFormTest(unittest.TestCase):
                 status=302,
                 url="https://auth.x.ai/oauth2/device/verify",
                 headers={"location": "https://accounts.x.ai/oauth2/device/consent?user_code=ABCD-EFGH"},
-            ),
-            response(
-                url="https://accounts.x.ai/oauth2/device/consent?user_code=ABCD-EFGH",
-                text=self.HTML,
             ),
             response(
                 status=302,
@@ -241,7 +413,6 @@ class DeviceConsentFormTest(unittest.TestCase):
                 url="https://auth.x.ai/oauth2/device/verify",
                 headers={"location": "https://accounts.x.ai/sign-in"},
             ),
-            response(status=401, url="https://accounts.x.ai/sign-in"),
             response(
                 status=302,
                 url="https://auth.x.ai/oauth2/device/verify",
@@ -254,7 +425,6 @@ class DeviceConsentFormTest(unittest.TestCase):
                 url="https://auth.x.ai/oauth2/device/verify",
                 headers={"location": "https://accounts.x.ai/oauth2/device/consent"},
             ),
-            response(url="https://accounts.x.ai/oauth2/device/consent", text=self.HTML),
             response(
                 status=302,
                 url="https://auth.x.ai/oauth2/device/approve",
@@ -448,7 +618,6 @@ class DeviceConsentFormTest(unittest.TestCase):
             item.json.return_value = payload or {}
             return item
 
-        consent_html = DeviceConsentFormTest.HTML
         client = MagicMock()
         client.base_url = "https://accounts.x.ai"
         client.bootstrap.return_value = SimpleNamespace(sitekey="turnstile-sitekey")
@@ -466,7 +635,6 @@ class DeviceConsentFormTest(unittest.TestCase):
                 url="https://auth.x.ai/oauth2/device/verify",
                 headers={"location": "https://accounts.x.ai/oauth2/device/consent"},
             ),
-            response(url="https://accounts.x.ai/oauth2/device/consent", text=consent_html),
             response(
                 status=302,
                 url="https://auth.x.ai/oauth2/device/approve",
@@ -494,7 +662,7 @@ class DeviceConsentFormTest(unittest.TestCase):
 
         self.assertEqual(result["access_token"], "access-token")
         self.assertEqual(result["refresh_token"], "refresh-token")
-        self.assertEqual(client._request.call_count, 8)
+        self.assertEqual(client._request.call_count, 7)
 
     def test_create_session_error_is_reported_before_consent_navigation(self) -> None:
         def response(*, status: int = 200, url: str = "", headers=None, payload=None, text: str = ""):

@@ -322,7 +322,7 @@
               <th class="w-[8rem] py-3 pr-5">SSO 状态</th>
               <th class="w-[11rem] py-3 pr-5">SSO 额度 A / F / E / H / C</th>
               <th class="w-[8.5rem] py-3 pr-5">OAuth 状态</th>
-              <th class="w-[13rem] py-3 pr-5">OAuth 额度</th>
+              <th class="w-[13rem] py-3 pr-5">OAuth 剩余 / 重置</th>
               <th class="w-[7rem] py-3 pr-5">恢复时间</th>
               <th class="w-[9rem] py-3 pr-5">成功 / 失败</th>
               <th class="w-[8rem] py-3 pr-5">最近使用</th>

@@ -16,7 +16,10 @@ from typing import Any, Iterable
 
 
 XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
-XAI_OAUTH_SCOPE = "openid profile email offline_access grok-cli:access api:access"
+XAI_OAUTH_SCOPE = (
+    "openid profile email offline_access grok-cli:access api:access "
+    "conversations:read conversations:write"
+)
 XAI_DEVICE_CODE_URL = "https://auth.x.ai/oauth2/device/code"
 XAI_TOKEN_URL = "https://auth.x.ai/oauth2/token"
 XAI_CLI_BASE_URL = "https://cli-chat-proxy.grok.com/v1"

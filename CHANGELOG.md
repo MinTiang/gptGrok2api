@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.0 - 2026-07-25
+
++ [新增] Grok 注册支持在同一有头浏览器会话内完成中文资料填写、邮箱确认、Turnstile 与账号创建，并增加页面状态诊断、截图和确认邮件兜底。
++ [新增] Grok OAuth 账号轮询改为显式开关，关闭后立即停止历史无额度复检、自动重新授权和未授权回填；开启后立即调度并持久化状态。
++ [新增] Grok OAuth 日志按授权阶段自动清理，账号页支持批量重新授权，并完整显示相关邮箱账号与处理状态。
++ [修复] Device OAuth 补齐 Cookie 会话复用、consent 状态识别和权限待生效复检，明确区分拒绝授权、真实无额度、限流与上游未返回额度。
++ [修复] Grok 账号统计和列表使用上游 billing 返回的真实请求及 Token 额度，未知额度不再错误显示为满额或无额度。
++ [优化] ZooProxy 注册任务自动生成独立 SID，并在单个任务的注册、验证、Turnstile 和 OAuth 全链路保持同一出口；Playwright 兼容 `socks5h` 代理配置。
++ [工具] 增加 Grok 4.5 账号批量探测与无额度账号导出清理脚本。
+
 ## 1.1.0 - 2026-07-23
 
 + [修复] Grok PKCE 能识别 `accounts.x.ai` consent Server Action 返回的 `Access denied`，明确标记为账号未获 Build/API OAuth 授权资格且不可重试，不再误报为 OAuth redirect loop。

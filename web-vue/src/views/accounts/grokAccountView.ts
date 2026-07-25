@@ -5,8 +5,27 @@ function cleanString(value: unknown): string {
   return String(value || '').trim()
 }
 
+function accountEventTimestamp(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value
+  const text = cleanString(value)
+  if (!text) return null
+  const numeric = Number(text)
+  if (Number.isFinite(numeric) && numeric > 0) return numeric
+  const parsed = Date.parse(text)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function hasCurrentValidProbe(item: GrokAccount): boolean {
+  if (cleanString(item.probe_status).toLowerCase() !== 'valid') return false
+  const quota = item.probe_quota
+  if (!quota || !Number.isFinite(Number(quota.remaining)) || !Number.isFinite(Number(quota.total))) return false
+  const probedAt = accountEventTimestamp(item.probe_at)
+  const refreshedAt = accountEventTimestamp(item.refresh_at)
+  return probedAt === null || refreshedAt === null || probedAt >= refreshedAt
+}
+
 export function grokRefreshFailed(item: GrokAccount): boolean {
-  return cleanString(item.refresh_status).toLowerCase() === 'failed'
+  return cleanString(item.refresh_status).toLowerCase() === 'failed' && !hasCurrentValidProbe(item)
 }
 
 export function grokRefreshStatusTitle(item: GrokAccount): string {
@@ -225,30 +244,26 @@ export function grokOAuthRecoveryStatusTitle(item: GrokAccount): string {
   ].filter(Boolean).join(' · ')
 }
 
-function oauthQuotaWindowText(value: unknown): string {
-  if (!value || typeof value !== 'object') return '-'
-  const source = value as Record<string, unknown>
-  const remaining = Number(source.remaining)
-  const limit = Number(source.limit)
-  const format = (number: number) => Math.max(0, Math.trunc(number)).toLocaleString('zh-CN')
-  if (Number.isFinite(remaining) && Number.isFinite(limit)) return `${format(remaining)}/${format(limit)}`
-  if (Number.isFinite(remaining)) return format(remaining)
-  return '-'
+function oauthQuotaPercentText(value: unknown): string {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return '-'
+  const bounded = Math.min(100, Math.max(0, number))
+  return `${bounded.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}%`
 }
 
-export function grokOAuthRequestQuotaText(item: GrokAccount): string {
-  return oauthQuotaWindowText(item.oauth?.quota?.requests)
+export function grokOAuthRemainingQuotaText(item: GrokAccount): string {
+  return oauthQuotaPercentText(item.oauth?.quota?.remaining_percent)
 }
 
-export function grokOAuthTokenQuotaText(item: GrokAccount): string {
-  return oauthQuotaWindowText(item.oauth?.quota?.tokens)
+export function grokOAuthQuotaResetText(item: GrokAccount): string {
+  return formatGrokAccountDate(item.oauth?.quota?.period?.end)
 }
 
 export function grokOAuthQuotaText(item: GrokAccount): string {
   if (!item.oauth?.quota || typeof item.oauth.quota !== 'object') return '-'
-  const requests = grokOAuthRequestQuotaText(item)
-  const tokens = grokOAuthTokenQuotaText(item)
-  return [requests !== '-' ? `请求 ${requests}` : '', tokens !== '-' ? `Token ${tokens}` : ''].filter(Boolean).join(' · ') || '-'
+  const remaining = grokOAuthRemainingQuotaText(item)
+  const reset = grokOAuthQuotaResetText(item)
+  return [remaining !== '-' ? `剩余 ${remaining}` : '', reset !== '-' ? `重置 ${reset}` : ''].filter(Boolean).join(' · ') || '-'
 }
 
 export function grokOAuthStatusTitle(item: GrokAccount): string {

@@ -23,11 +23,13 @@ from urllib.parse import parse_qsl, quote, unquote, urljoin, urlparse
 from curl_cffi import requests
 
 from services.config import DATA_DIR
+from services.xai_browser_bridge import XaiBrowserBridge, XaiBrowserBridgeError
+from services.xai_session_cookies import apply_cookie_jar, snapshot_session_cookie_jar
 
 
 DEFAULT_BASE_URL = "https://accounts.x.ai"
 DEFAULT_SIGNUP_PATH = "/sign-up?redirect=grok-com"
-REFERENCE_SIGNUP_PATH = "/sign-up?redirect=cloud-console"
+REFERENCE_SIGNUP_PATH = "/sign-up?redirect=grok-com"
 DEFAULT_ACTION_ID = "7f50061dd2f5b389a530e4a048d5fdf0c48d1d9259"
 DEFAULT_CASTLE_PK = "pk_p8GGWvD3TmFJZRsX3BQcqAv9aFVispNz"
 DEFAULT_TURNSTILE_SITEKEY = "0x4AAAAAAAhr9JGVDZbrZOo0"
@@ -148,6 +150,10 @@ def _looks_like_mail_error(message: str) -> bool:
         "email_in_use",
         "email malformed",
         "invalid email",
+        "existing account found",
+        "account already exists",
+        "already exists",
+        "already in use",
         "邮箱域名",
         "邮箱已",
     )
@@ -722,7 +728,7 @@ class CastleRunner:
                     "sdkPath": str(sdk_path),
                     "pk": str(pk),
                     "url": str(page_url),
-                    "referrer": "https://grok.com/",
+                    "referrer": "https://console.x.ai/" if "Windows" in str(user_agent) else "https://grok.com/",
                     "userAgent": str(user_agent),
                     "timeoutMs": max(1000, int(float(timeout) * 1000)),
                 }
@@ -774,6 +780,7 @@ class TurnstileSolver:
         self.request_timeout = max(1.0, float(self.config.get("request_timeout") or 30))
         self.transport = transport
         self.session = requests.Session(impersonate="chrome120", trust_env=False)
+        self.last_solution: dict[str, Any] = {}
 
     def close(self) -> None:
         self.session.close()
@@ -848,7 +855,15 @@ class TurnstileSolver:
             return str(data.get("errorDescription") or data.get("errorCode") or f"errorId={error_id}")
         return str(data.get("error") or "").strip()
 
-    def solve(self, *, website_url: str, sitekey: str, action: str = "") -> str:
+    def solve(
+        self,
+        *,
+        website_url: str,
+        sitekey: str,
+        action: str = "",
+        initial_cookies: list[dict[str, Any]] | None = None,
+    ) -> str:
+        self.last_solution = {}
         if self.provider == "local":
             base_url = str(self.config.get("api_base") or "http://127.0.0.1:8877").strip().rstrip("/")
             max_attempts = max(1, min(5, int(self.config.get("local_max_attempts") or 3)))
@@ -891,6 +906,8 @@ class TurnstileSolver:
                     payload["action"] = action
                 if proxy and proxy.lower() != "direct":
                     payload["proxy"] = proxy
+                if initial_cookies:
+                    payload["cookies"] = initial_cookies
                 try:
                     result = self._post(
                         f"{base_url}/solve",
@@ -907,6 +924,7 @@ class TurnstileSolver:
                     continue
                 token = str(result.get("token") or "").strip()
                 if result.get("solved") is True and token:
+                    self.last_solution = dict(result)
                     return token
                 last_error = str(result.get("error") or result.get("detail") or "").strip()
             raise GrokProtocolError(
@@ -950,6 +968,7 @@ class TurnstileSolver:
             token = str(solution.get("token") or result.get("token") or "").strip()
             if status in {"ready", "success"} or token:
                 if token:
+                    self.last_solution = dict(solution or result)
                     return token
                 raise GrokProtocolError("Turnstile 已完成但未返回 token", stage="captcha")
             if status and status not in {"processing", "pending", "queued"}:
@@ -1002,9 +1021,21 @@ class GrokProtocolClient:
         default_impersonate = "chrome146" if self.signup_flow == "xconsole" else "chrome120"
         impersonate = str(self.config.get("impersonate") or default_impersonate).strip()
         self._reference_client: Any = None
+        configured_browser_flow = self.config.get("browser_flow_enabled")
+        browser_flow_enabled = (
+            str(configured_browser_flow).strip().lower() not in {"0", "false", "no", "off"}
+            if configured_browser_flow is not None
+            else False
+        )
+        configured_reference_signup = self.config.get("xconsole_reference_signup_enabled")
+        reference_signup_enabled = (
+            str(configured_reference_signup).strip().lower() not in {"0", "false", "no", "off"}
+            if configured_reference_signup is not None
+            else browser_flow_enabled
+        )
         reference_dir = Path(str(self.config.get("xai_cli_pkce_reference_dir") or "")).expanduser()
         reference_client_file = reference_dir / "xconsole_client" / "client.py"
-        if self.signup_flow == "xconsole" and reference_client_file.is_file():
+        if self.signup_flow == "xconsole" and reference_signup_enabled and reference_client_file.is_file():
             reference_path = str(reference_dir.resolve())
             if reference_path not in sys.path:
                 sys.path.insert(0, reference_path)
@@ -1042,12 +1073,48 @@ class GrokProtocolClient:
         self._landing_html = ""
         self._script_sources: dict[str, str] = {}
         self._grok_session_warmed = False
+        self._browser_bridge: XaiBrowserBridge | None = None
+        self._browser_cookie_jar: list[dict[str, Any]] = []
+        self._browser_router_state_tree = ""
+        self._solver_page_state: dict[str, Any] = {}
+
+    @property
+    def browser_session_id(self) -> str:
+        bridge = self._browser_bridge
+        return str(bridge.session_id if bridge is not None else "").strip()
+
+    @property
+    def browser_bridge(self) -> XaiBrowserBridge | None:
+        return self._browser_bridge
+
+    def _browser_flow_enabled(self) -> bool:
+        configured = self.config.get("browser_flow_enabled")
+        if configured is not None:
+            return str(configured).strip().lower() not in {"0", "false", "no", "off"}
+        return False
+
+    def _ensure_browser_bridge(self) -> None:
+        if not self._browser_flow_enabled() or self.browser_session_id:
+            return
+        bridge = XaiBrowserBridge(self.config, proxy=self.proxy)
+        try:
+            bridge.start(signup_url=self.signup_url)
+        except Exception:
+            bridge.close()
+            raise
+        self._browser_bridge = bridge
+        self._emit("xAI 同会话浏览器已启动")
 
     def close(self) -> None:
-        if self._reference_client is not None:
-            self._reference_client.close()
-        else:
-            self.session.close()
+        try:
+            if self._browser_bridge is not None:
+                self._browser_bridge.close()
+                self._browser_bridge = None
+        finally:
+            if self._reference_client is not None:
+                self._reference_client.close()
+            else:
+                self.session.close()
 
     def _emit(self, message: str) -> None:
         if self.log:
@@ -1226,9 +1293,14 @@ class GrokProtocolClient:
                 castle_sdk_url="",
                 castle_sdk_path="",
             )
+            self._browser_router_state_tree = str(
+                getattr(self._reference_client, "next_router_state_tree", "") or ""
+            ).strip()
+            self._ensure_browser_bridge()
             return self.metadata
         html = self._get_landing()
         self.metadata = self._discover(html, force=force)
+        self._ensure_browser_bridge()
         return self.metadata
 
     def _metadata(self) -> SignupMetadata:
@@ -1271,6 +1343,9 @@ class GrokProtocolClient:
         return decode_grpc_web_response(bytes(response.content or b""), response.headers)
 
     def send_email_validation_code(self, email: str) -> None:
+        if self._browser_bridge is not None:
+            self._browser_bridge.send_email_validation_code(email)
+            return
         if self._reference_client is not None:
             result = self._reference_client.create_email_validation_code(email)
             if not bool(result.ok):
@@ -1281,7 +1356,7 @@ class GrokProtocolClient:
                     mail_retryable=True,
                 )
             return
-        castle_token = "" if self.signup_flow == "xconsole" else self.create_castle_token()
+        castle_token = self.create_castle_token()
         self._grpc_post(
             "/auth_mgmt.AuthManagement/CreateEmailValidationCode",
             create_email_validation_request(email, castle_token),
@@ -1290,6 +1365,8 @@ class GrokProtocolClient:
     send_email_code = send_email_validation_code
 
     def validate_password(self, email: str, password: str) -> None:
+        if self._browser_bridge is not None:
+            return
         if self._reference_client is not None:
             self._reference_client.validate_password(email, password)
             return
@@ -1301,6 +1378,9 @@ class GrokProtocolClient:
         )
 
     def verify_email_validation_code(self, email: str, code: str) -> str:
+        if self._browser_bridge is not None:
+            self._browser_bridge.verify_email_validation_code(email, code)
+            return ""
         if self._reference_client is not None:
             result = self._reference_client.verify_email_validation_code(email, code)
             if not bool(result.ok):
@@ -1321,19 +1401,63 @@ class GrokProtocolClient:
         return ""
 
     def solve_turnstile(self) -> str:
+        if self._browser_bridge is not None:
+            # The persistent registration browser must solve its own visible widget
+            # so the page's Turnstile callback and React state are updated together.
+            return ""
         metadata = self._metadata()
         solver_config = dict(self.config)
         if self.proxy and self.proxy.lower() != "direct":
             solver_config["proxy"] = self.proxy
         solver = TurnstileSolver(solver_config)
         try:
-            return solver.solve(
+            token = solver.solve(
                 website_url=metadata.signup_url,
                 sitekey=metadata.sitekey,
                 action=str(self.config.get("action") or "").strip(),
+                initial_cookies=self.session_cookie_jar(),
             )
+            self._adopt_turnstile_browser_state(solver.last_solution)
+            return token
         finally:
             solver.close()
+
+    def _adopt_turnstile_browser_state(self, solution: dict[str, Any]) -> None:
+        if not isinstance(solution, dict) or not solution:
+            return
+        cookies = solution.get("cookies") if isinstance(solution.get("cookies"), list) else []
+        applied = apply_cookie_jar(self.session, cookies)
+
+        user_agent = str(solution.get("user_agent") or "").strip()
+        if user_agent:
+            self.user_agent = user_agent
+            self.session.headers["User-Agent"] = user_agent
+
+        hints = solution.get("client_hints") if isinstance(solution.get("client_hints"), dict) else {}
+        for source, target in (
+            ("sec_ch_ua", "Sec-CH-UA"),
+            ("sec_ch_ua_mobile", "Sec-CH-UA-Mobile"),
+            ("sec_ch_ua_platform", "Sec-CH-UA-Platform"),
+        ):
+            value = str(hints.get(source) or "").strip()
+            if value:
+                self.session.headers[target] = value
+
+        languages = solution.get("languages") if isinstance(solution.get("languages"), list) else []
+        language = str(solution.get("language") or (languages[0] if languages else "")).strip()
+        if language:
+            fallback = language.split("-", 1)[0]
+            self.session.headers["Accept-Language"] = (
+                f"{language},{fallback};q=0.9" if fallback and fallback != language else language
+            )
+
+        page_state = solution.get("page_state") if isinstance(solution.get("page_state"), dict) else {}
+        self._solver_page_state = _safe_json_clone(page_state)
+        self._emit(
+            "Turnstile 浏览器状态已接入协议会话: "
+            f"Cookie={applied}, UA={'yes' if user_agent else 'no'}, "
+            f"Client-Hints={'yes' if hints else 'no'}"
+        )
 
     def _server_action_request(self, payload: dict[str, Any]):
         metadata = self._metadata()
@@ -1449,6 +1573,12 @@ class GrokProtocolClient:
 
     def session_cookies(self) -> dict[str, str]:
         """Return a transient cookie snapshot for the immediate PKCE handoff."""
+        if self._browser_cookie_jar:
+            return {
+                str(item.get("name")): str(item.get("value"))
+                for item in self._browser_cookie_jar
+                if str(item.get("name") or "").strip() and str(item.get("value") or "").strip()
+            }
         values: dict[str, str] = {}
         jar = getattr(self.session.cookies, "jar", None)
         if jar is not None:
@@ -1468,6 +1598,12 @@ class GrokProtocolClient:
             for name, value in raw.items()
             if str(name).strip() and str(value).strip()
         }
+
+    def session_cookie_jar(self) -> list[dict[str, Any]]:
+        """Return the complete scoped cookie jar for OAuth handoff/retry."""
+        if self._browser_cookie_jar:
+            return _safe_json_clone(self._browser_cookie_jar)
+        return snapshot_session_cookie_jar(self.session)
 
     def _prewarm_grok_session(self) -> None:
         if self._grok_session_warmed and self._cookie_value("grok_device_id"):
@@ -1627,6 +1763,42 @@ class GrokProtocolClient:
         password: str,
         turnstile_token: str,
     ) -> dict[str, Any]:
+        if self._browser_bridge is not None:
+            metadata = self._metadata()
+            router_state = self._browser_router_state_tree or quote(
+                json.dumps(metadata.router_state_tree, ensure_ascii=False, separators=(",", ":")),
+                safe="",
+            )
+            try:
+                result = self._browser_bridge.signup(
+                    email=email,
+                    password=password,
+                    code=code,
+                    given_name=given_name,
+                    family_name=family_name,
+                    turnstile_token=turnstile_token,
+                    action_id=metadata.action_id,
+                    next_router_state_tree=router_state,
+                )
+            except XaiBrowserBridgeError as exc:
+                raise GrokProtocolError(
+                    str(exc),
+                    stage=exc.stage,
+                    retryable=exc.retryable,
+                    mail_retryable=_looks_like_mail_error(str(exc)),
+                    reason_code=f"browser_{exc.stage}",
+                    account_created=exc.stage in {"cookie_setter", "session_exchange"},
+                ) from exc
+            cookies = result.get("cookies") if isinstance(result.get("cookies"), list) else []
+            self._browser_cookie_jar = [dict(item) for item in cookies if isinstance(item, dict)]
+            return {
+                "email": email,
+                "password": password,
+                "sso": str(result.get("sso") or "").strip(),
+                "sso_rw": str(result.get("sso_rw") or "").strip(),
+                "redirect_url": str(result.get("redirect_url") or "").strip(),
+                "session_reason": "browser_cookie_setter",
+            }
         if self._reference_client is not None:
             result = self._reference_client.create_account(
                 email=email,
@@ -1700,7 +1872,7 @@ class GrokProtocolClient:
         if self.signup_flow != "xconsole":
             self._prewarm_grok_session()
         for attempt in range(2):
-            castle_token = "" if self.signup_flow == "xconsole" else self.create_castle_token()
+            castle_token = self.create_castle_token()
             tos_version: int | str = "$undefined" if self.signup_flow == "xconsole" else 1
             payload = {
                 "emailValidationCode": code,
@@ -1712,6 +1884,7 @@ class GrokProtocolClient:
                     "tosAcceptedVersion": tos_version,
                 },
                 "turnstileToken": turnstile_token,
+                "promptOnDuplicateEmail": True,
                 "conversionId": str(uuid.uuid4()),
                 "castleRequestToken": castle_token,
             }

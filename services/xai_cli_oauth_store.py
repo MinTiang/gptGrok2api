@@ -167,26 +167,61 @@ def _optional_non_negative_int(value: object) -> int | None:
         return None
 
 
+def _optional_percent(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if number != number or number in {float("inf"), float("-inf")}:
+        return None
+    return round(min(100.0, max(0.0, number)), 2)
+
+
 def _quota_snapshot(value: object) -> dict[str, Any]:
     source = value if isinstance(value, dict) else {}
     result: dict[str, Any] = {}
-    for key in ("requests", "tokens"):
-        raw_window = source.get(key)
-        if not isinstance(raw_window, dict):
-            continue
-        limit = _optional_non_negative_int(raw_window.get("limit"))
-        remaining = _optional_non_negative_int(raw_window.get("remaining"))
-        if limit is None and remaining is None:
-            continue
-        window: dict[str, Any] = {}
-        if limit is not None:
-            window["limit"] = limit
-        if remaining is not None:
-            window["remaining"] = remaining
-        reset = _clean_text(raw_window.get("reset"))[:100]
-        if reset:
-            window["reset"] = reset
-        result[key] = window
+    quota_source = _clean_text(source.get("source")).lower()
+    if quota_source in {"billing", "model_probe"}:
+        result["source"] = quota_source
+    used_percent = _optional_percent(source.get("used_percent"))
+    remaining_percent = _optional_percent(source.get("remaining_percent"))
+    if used_percent is not None:
+        result["used_percent"] = used_percent
+    if remaining_percent is not None:
+        result["remaining_percent"] = remaining_percent
+
+    raw_period = source.get("period")
+    if isinstance(raw_period, dict):
+        period = {
+            "type": _clean_text(raw_period.get("type"))[:100],
+            "start": _clean_text(raw_period.get("start"))[:100],
+            "end": _clean_text(raw_period.get("end"))[:100],
+        }
+        if any(period.values()):
+            result["period"] = period
+
+    products: list[dict[str, Any]] = []
+    raw_products = source.get("product_usage")
+    if isinstance(raw_products, list):
+        for raw_product in raw_products[:20]:
+            if not isinstance(raw_product, dict):
+                continue
+            product = _clean_text(raw_product.get("product"))[:100]
+            product_used = _optional_percent(raw_product.get("used_percent"))
+            product_remaining = _optional_percent(raw_product.get("remaining_percent"))
+            if not product and product_used is None and product_remaining is None:
+                continue
+            item: dict[str, Any] = {"product": product}
+            if product_used is not None:
+                item["used_percent"] = product_used
+            if product_remaining is not None:
+                item["remaining_percent"] = product_remaining
+            products.append(item)
+    if products:
+        result["product_usage"] = products
+
     updated_at = _clean_text(source.get("updated_at"))
     if result and updated_at:
         result["updated_at"] = updated_at

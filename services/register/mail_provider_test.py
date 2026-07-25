@@ -451,6 +451,26 @@ class ICloudPrivacyMailProviderTest(unittest.TestCase):
         effective_headers = {**session.headers, **dict(kwargs.get("headers") or {})}
         self.assertEqual(effective_headers.get("X-ChatGPT2API-Internal"), "icloud-privacy-mail")
 
+    def test_mark_local_existing_grok_account_as_claimed(self) -> None:
+        session = self._session(self._response({"success": True, "updated": 1, "missing": []}))
+        mailbox = {
+            "provider": "icloud_api",
+            "address": "existing@icloud.example",
+            "_icloud_claim_internal": True,
+            "_icloud_claim_base": "https://icloud-mail.example.test",
+            "_icloud_claim_project": "grok",
+        }
+
+        with patch.object(mail_provider, "_create_session", return_value=session):
+            mail_provider.mark_mailbox_result(
+                mailbox,
+                success=False,
+                error="Existing account found An account already exists which is associated with this email address.",
+            )
+
+        _url, kwargs = self._request_call(session, "POST")
+        self.assertEqual(kwargs["json"]["claimed"], True)
+
     def test_mark_local_transient_failure_as_unclaimed(self) -> None:
         session = self._session(self._response({"success": True, "updated": 1, "missing": []}))
         mailbox = {

@@ -26,15 +26,18 @@ function define(target, key, value) {
 
 function installEnvironment(window, options) {
   const userAgent = options.userAgent;
+  const chromeMajor = /Chrome\/(\d+)/.exec(userAgent)?.[1] || '146';
+  const windows = /Windows/i.test(userAgent);
+  const platformName = windows ? 'Windows' : 'macOS';
   define(window.navigator, 'userAgent', userAgent);
-  define(window.navigator, 'platform', 'MacIntel');
+  define(window.navigator, 'platform', windows ? 'Win32' : 'MacIntel');
   define(window.navigator, 'vendor', 'Google Inc.');
   define(window.navigator, 'webdriver', false);
   define(window.navigator, 'hardwareConcurrency', 8);
   define(window.navigator, 'deviceMemory', 8);
   define(window.navigator, 'maxTouchPoints', 0);
-  define(window.navigator, 'languages', ['en-US', 'en']);
-  define(window.navigator, 'language', 'en-US');
+  define(window.navigator, 'languages', ['zh-CN', 'zh']);
+  define(window.navigator, 'language', 'zh-CN');
   define(window.navigator, 'pdfViewerEnabled', true);
   define(window.navigator, 'connection', {
     effectiveType: '4g',
@@ -44,12 +47,12 @@ function installEnvironment(window, options) {
   });
   define(window.navigator, 'userAgentData', {
     brands: [
-      { brand: 'Not_A Brand', version: '8' },
-      { brand: 'Chromium', version: '120' },
-      { brand: 'Google Chrome', version: '120' },
+      { brand: 'Chromium', version: chromeMajor },
+      { brand: 'Google Chrome', version: chromeMajor },
+      { brand: 'Not/A)Brand', version: '99' },
     ],
     mobile: false,
-    platform: 'macOS',
+    platform: platformName,
   });
   define(window.navigator, 'permissions', {
     async query() {
@@ -62,17 +65,17 @@ function installEnvironment(window, options) {
     },
   });
 
-  define(window, 'innerWidth', 1440);
-  define(window, 'innerHeight', 900);
-  define(window, 'outerWidth', 1440);
-  define(window, 'outerHeight', 900);
-  define(window, 'devicePixelRatio', 2);
+  define(window, 'innerWidth', 1920);
+  define(window, 'innerHeight', 947);
+  define(window, 'outerWidth', 1920);
+  define(window, 'outerHeight', 1080);
+  define(window, 'devicePixelRatio', 1);
   define(window, 'screenX', 0);
   define(window, 'screenY', 25);
-  define(window.screen, 'width', 1440);
-  define(window.screen, 'height', 900);
-  define(window.screen, 'availWidth', 1440);
-  define(window.screen, 'availHeight', 875);
+  define(window.screen, 'width', 1920);
+  define(window.screen, 'height', 1080);
+  define(window.screen, 'availWidth', 1920);
+  define(window.screen, 'availHeight', 1040);
   define(window.screen, 'colorDepth', 24);
   define(window.screen, 'pixelDepth', 24);
 

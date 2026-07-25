@@ -42,6 +42,7 @@ class ProviderAccountStatsTest(unittest.IsolatedAsyncioTestCase):
                 },
             ),
             patch.object(provider_account_stats, "grok_runtime", fake_runtime),
+            patch.object(provider_account_stats.grok_account_store, "list_accounts", return_value=[]),
             patch.object(
                 provider_account_stats.xai_cli_oauth_store,
                 "list_accounts",
@@ -62,6 +63,58 @@ class ProviderAccountStatsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["providers"]["gpt"]["total"], 2)
         self.assertEqual(stats["providers"]["grok"]["total"], 5)
         self.assertEqual(stats["providers"]["grok_oauth"]["total_quota"], 0)
+
+    async def test_unified_stats_deduplicate_runtime_linked_oauth_accounts(self) -> None:
+        fake_runtime = type(
+            "FakeRuntime",
+            (),
+            {
+                "available": True,
+                "account_stats": AsyncMock(
+                    return_value={
+                        "total": 2,
+                        "active": 2,
+                        "total_success": 7,
+                        "total_fail": 1,
+                    }
+                ),
+            },
+        )()
+        oauth_items = [
+            {
+                "email": "linked@example.com",
+                "status": "active",
+                "use_count": 5,
+                "fail_count": 2,
+                "quota": {"remaining_percent": 65},
+            },
+            {
+                "email": "oauth-only@example.com",
+                "status": "active",
+                "use_count": 3,
+                "fail_count": 0,
+                "quota": {"remaining_percent": 100},
+            },
+        ]
+        registered = [
+            {
+                "email": "linked@example.com",
+                "runtime": {"present": True, "status": "active"},
+            }
+        ]
+        with (
+            patch.object(provider_account_stats.account_service, "get_stats", return_value={}),
+            patch.object(provider_account_stats, "grok_runtime", fake_runtime),
+            patch.object(provider_account_stats.grok_account_store, "list_accounts", return_value=registered),
+            patch.object(provider_account_stats.xai_cli_oauth_store, "list_accounts", return_value=oauth_items),
+        ):
+            stats = await provider_account_stats.get_provider_account_stats()
+
+        self.assertEqual(stats["providers"]["grok"]["total"], 3)
+        self.assertEqual(stats["providers"]["grok"]["active"], 3)
+        self.assertEqual(stats["providers"]["grok_oauth"]["total"], 2)
+        self.assertEqual(stats["providers"]["grok"]["total_success"], 15)
+        self.assertEqual(stats["providers"]["grok"]["total_fail"], 3)
 
     async def test_image_stats_exclude_text_only_oauth_accounts(self) -> None:
         fake_runtime = type(
@@ -108,6 +161,7 @@ class ProviderAccountStatsTest(unittest.IsolatedAsyncioTestCase):
                 return_value={"total": 2, "active": 2, "total_quota": 20},
             ),
             patch.object(provider_account_stats, "grok_runtime", fake_runtime),
+            patch.object(provider_account_stats.grok_account_store, "list_accounts", return_value=[]),
             patch.object(provider_account_stats.xai_cli_oauth_store, "list_accounts", return_value=[]),
         ):
             stats = await provider_account_stats.get_provider_account_stats()

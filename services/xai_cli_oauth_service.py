@@ -50,7 +50,7 @@ _REFRESH_EARLY_SECONDS = 60
 _DEVICE_SESSION_MAX_SECONDS = 1_800
 _ERROR_BODY_LIMIT = 1_200
 _PROTOCOL_JOB_TTL_SECONDS = 3_600
-_PROTOCOL_DEFER_POLL_SECONDS = 2.0
+_PROTOCOL_DEFER_POLL_SECONDS = 15.0
 _PROTOCOL_QUEUE_WORKERS = 2
 _PROTOCOL_QUEUE_MAX_ATTEMPTS = 2
 _PROTOCOL_RETRY_STAGES = frozenset(
@@ -70,6 +70,7 @@ _PROTOCOL_RETRY_STAGES = frozenset(
     }
 )
 AccountSelectedCallback = Callable[[dict[str, str]], None]
+_INITIAL_PROTOCOL_PROBE_DELAY_SECONDS = 5
 
 
 def _now_epoch() -> int:
@@ -114,32 +115,81 @@ def _safe_error_body(response: httpx.Response) -> str:
     return text[:_ERROR_BODY_LIMIT]
 
 
-def _optional_header_int(value: object) -> int | None:
-    text = _clean_text(value)
-    if not text:
-        return None
+def _percent(value: object, *, default: float | None = None) -> float | None:
+    if value is None or value == "":
+        return default
     try:
-        return max(0, int(text))
+        number = float(value)
     except (TypeError, ValueError, OverflowError):
-        return None
+        return default
+    if number != number or number in {float("inf"), float("-inf")}:
+        return default
+    return round(min(100.0, max(0.0, number)), 2)
 
 
-def _response_quota(response: httpx.Response) -> dict[str, dict[str, Any]]:
-    result: dict[str, dict[str, Any]] = {}
-    for key in ("requests", "tokens"):
-        limit = _optional_header_int(response.headers.get(f"x-ratelimit-limit-{key}"))
-        remaining = _optional_header_int(response.headers.get(f"x-ratelimit-remaining-{key}"))
-        if limit is None and remaining is None:
-            continue
-        window: dict[str, Any] = {}
-        if limit is not None:
-            window["limit"] = limit
-        if remaining is not None:
-            window["remaining"] = remaining
-        reset = _clean_text(response.headers.get(f"x-ratelimit-reset-{key}"))
-        if reset:
-            window["reset"] = reset[:100]
-        result[key] = window
+def _billing_quota(response: httpx.Response) -> dict[str, Any]:
+    """Extract the authoritative credit percentage from the CLI billing API."""
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    config_payload = payload.get("config")
+    billing_config = config_payload if isinstance(config_payload, dict) else {}
+    product_payload = payload.get("productUsage")
+    has_billing_shape = (
+        "creditUsagePercent" in payload
+        or isinstance(config_payload, dict)
+        or isinstance(product_payload, list)
+    )
+    if not has_billing_shape:
+        return {}
+
+    # protobuf JSON omits scalar fields at their default value, so a missing
+    # creditUsagePercent in an otherwise valid billing response means 0% used.
+    used_percent = _percent(payload.get("creditUsagePercent"), default=0.0)
+    if used_percent is None:
+        return {}
+    result: dict[str, Any] = {
+        "source": "billing",
+        "used_percent": used_percent,
+        "remaining_percent": round(100.0 - used_percent, 2),
+    }
+
+    current_period = billing_config.get("currentPeriod")
+    if isinstance(current_period, dict):
+        period = {
+            "type": _clean_text(current_period.get("type"))[:100],
+            "start": _clean_text(current_period.get("start"))[:100],
+            "end": _clean_text(current_period.get("end"))[:100],
+        }
+        if any(period.values()):
+            result["period"] = period
+
+    products: list[dict[str, Any]] = []
+    if isinstance(product_payload, list):
+        for raw_product in product_payload[:20]:
+            if not isinstance(raw_product, dict):
+                continue
+            product_used = _percent(
+                raw_product.get("creditUsagePercent", raw_product.get("usagePercent"))
+            )
+            product = _clean_text(
+                raw_product.get("product")
+                or raw_product.get("productType")
+                or raw_product.get("name")
+            )[:100]
+            if not product and product_used is None:
+                continue
+            item: dict[str, Any] = {"product": product}
+            if product_used is not None:
+                item["used_percent"] = product_used
+                item["remaining_percent"] = round(100.0 - product_used, 2)
+            products.append(item)
+    if products:
+        result["product_usage"] = products
     return result
 
 
@@ -184,8 +234,14 @@ def _sse(event: str, payload: dict[str, Any]) -> str:
 class XaiCliOAuthService:
     """Manage OAuth device sessions and dispatch Grok CLI Responses requests."""
 
-    def __init__(self, store: XaiCliOAuthAccountStore = xai_cli_oauth_store) -> None:
+    def __init__(
+        self,
+        store: XaiCliOAuthAccountStore = xai_cli_oauth_store,
+        *,
+        initial_probe_delay_seconds: float = _INITIAL_PROTOCOL_PROBE_DELAY_SECONDS,
+    ) -> None:
         self.store = store
+        self.initial_probe_delay_seconds = max(0.0, min(60.0, float(initial_probe_delay_seconds)))
         self._device_sessions: dict[str, dict[str, Any]] = {}
         self._device_lock = asyncio.Lock()
         self._refresh_locks: dict[str, asyncio.Lock] = {}
@@ -456,11 +512,14 @@ class XaiCliOAuthService:
         account_id: str = "",
         *,
         session_cookies: dict[str, str] | None = None,
+        session_cookie_jar: list[dict[str, Any]] | None = None,
         preauthorized_credential: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         source = self._select_protocol_source_account(account_id)
         if session_cookies:
             source = {**source, "_oauth_session_cookies": dict(session_cookies)}
+        if session_cookie_jar:
+            source = {**source, "_oauth_cookie_jar": list(session_cookie_jar)}
         if preauthorized_credential:
             source = {**source, "_preauthorized_oauth_credential": dict(preauthorized_credential)}
         source_account_id = _clean_text(source.get("id"))
@@ -499,11 +558,13 @@ class XaiCliOAuthService:
         account_id: str = "",
         *,
         session_cookies: dict[str, str] | None = None,
+        session_cookie_jar: list[dict[str, Any]] | None = None,
         preauthorized_credential: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         result, source = self._prepare_protocol_authorization(
             account_id,
             session_cookies=session_cookies,
+            session_cookie_jar=session_cookie_jar,
             preauthorized_credential=preauthorized_credential,
         )
         if source is None:
@@ -522,12 +583,14 @@ class XaiCliOAuthService:
         prioritize: bool = False,
         retry: bool = False,
         session_cookies: dict[str, str] | None = None,
+        session_cookie_jar: list[dict[str, Any]] | None = None,
         preauthorized_credential: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Queue protocol OAuth from synchronous registration workers."""
         result, source = self._prepare_protocol_authorization(
             account_id,
             session_cookies=session_cookies,
+            session_cookie_jar=session_cookie_jar,
             preauthorized_credential=preauthorized_credential,
         )
         if source is None:
@@ -596,6 +659,26 @@ class XaiCliOAuthService:
         profile = proxy_settings.get_profile(proxy=_clean_text(raw_proxy), upstream=True)
         return _clean_text(profile.proxy_url) or "direct"
 
+    @staticmethod
+    def _fresh_account_oauth_delay_seconds(
+        source: dict[str, Any],
+        grok_config: dict[str, Any],
+        *,
+        now: float | None = None,
+    ) -> float:
+        delay = max(
+            0,
+            min(60, int(grok_config.get("oauth_fresh_account_retry_delay") or 15)),
+        )
+        created_at = _clean_text(source.get("created_at"))
+        if not created_at or not delay:
+            return 0.0
+        try:
+            created_epoch = datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, delay - ((time.time() if now is None else now) - created_epoch))
+
     def _emit_protocol_event(self, payload: dict[str, Any]) -> None:
         sink = self.protocol_event_sink
         if sink is None:
@@ -638,6 +721,7 @@ class XaiCliOAuthService:
                                     "source_account_id": _clean_text(source.get("id")),
                                     "email": _clean_text(source.get("email")),
                                     "error": _clean_text(job.get("error")),
+                                    "credential_acquired": bool(job.get("credential_acquired")),
                                 }
                             )
                             break
@@ -704,23 +788,62 @@ class XaiCliOAuthService:
         def progress(stage: str, message: str) -> None:
             self._update_protocol_job(job_id, status="running", stage=stage, message=message)
 
+        credential_acquired = False
         try:
             if preauthorized:
                 credential = preauthorized
             else:
+                remaining_delay = self._fresh_account_oauth_delay_seconds(source, grok_config)
+                if remaining_delay > 0:
+                    delay_text = f"{remaining_delay:.0f}"
+                    self._update_protocol_job(
+                        job_id,
+                        stage="fresh_account_wait",
+                        message=f"新账号身份正在传播，等待 {delay_text} 秒后创建 Device Code",
+                    )
+                    await asyncio.sleep(remaining_delay)
                 protocol.progress = progress
                 authorize_kwargs = {
                     "email": _clean_text(source.get("email")),
                     "password": _clean_text(source.get("password")),
                     "sso": _clean_text(source.get("sso") or source.get("sso_token")),
                 }
-                if oauth_flow == "pkce_reference":
-                    authorize_kwargs["session_cookies"] = (
-                        dict(source.get("_oauth_session_cookies"))
-                        if isinstance(source.get("_oauth_session_cookies"), dict)
-                        else {}
-                    )
+                session_cookies = (
+                    dict(source.get("_oauth_session_cookies"))
+                    if isinstance(source.get("_oauth_session_cookies"), dict)
+                    else {}
+                )
+                session_cookie_jar = (
+                    list(source.get("_oauth_cookie_jar"))
+                    if isinstance(source.get("_oauth_cookie_jar"), list)
+                    else list(source.get("oauth_cookie_jar"))
+                    if isinstance(source.get("oauth_cookie_jar"), list)
+                    else []
+                )
+                if session_cookies:
+                    authorize_kwargs["session_cookies"] = session_cookies
+                if session_cookie_jar:
+                    authorize_kwargs["session_cookie_jar"] = session_cookie_jar
                 credential = await asyncio.to_thread(protocol.authorize, **authorize_kwargs)
+            credential_acquired = True
+            initial_probe_delay = self.initial_probe_delay_seconds
+            self._emit_protocol_event(
+                {
+                    "status": "probe_wait",
+                    "job_id": job_id,
+                    "source_account_id": _clean_text(source.get("id")),
+                    "email": _clean_text(source.get("email")),
+                    "delay_seconds": initial_probe_delay,
+                }
+            )
+            if initial_probe_delay > 0:
+                delay_text = f"{initial_probe_delay:g}"
+                self._update_protocol_job(
+                    job_id,
+                    stage="probe_wait",
+                    message=f"OAuth 凭据已获取，等待 {delay_text} 秒后首次探测 Grok 4.5",
+                )
+                await asyncio.sleep(initial_probe_delay)
             self._update_protocol_job(job_id, stage="models", message="验证 OAuth 凭据并探测模型")
             imported = await self.import_credentials(
                 access_token=_clean_text(credential.get("access_token")),
@@ -738,7 +861,7 @@ class XaiCliOAuthService:
                     job_id,
                     status="authorized",
                     stage="permission_pending",
-                    message="OAuth 授权完成，Grok 4.5 权限待生效",
+                    message="OAuth 凭据已保存，Grok 4.5 权限正在生效",
                     error="",
                     account=imported.get("account"),
                     models=imported.get("models") if isinstance(imported.get("models"), list) else [],
@@ -751,6 +874,7 @@ class XaiCliOAuthService:
                         "oauth_account_id": account_id,
                         "source_account_id": _clean_text(source.get("id")),
                         "email": _clean_text(source.get("email")),
+                        "probe": probe,
                         "delivery": {},
                     }
                 )
@@ -807,6 +931,7 @@ class XaiCliOAuthService:
                     "oauth_account_id": account_id,
                     "source_account_id": _clean_text(source.get("id")),
                     "email": _clean_text(source.get("email")),
+                    "probe": probe,
                     "delivery": delivery,
                 }
             )
@@ -822,6 +947,7 @@ class XaiCliOAuthService:
                 message="协议授权失败",
                 error=error[:500],
                 retryable=bool(getattr(exc, "retryable", False)),
+                credential_acquired=credential_acquired,
             )
             if notify_failure:
                 self._emit_protocol_event(
@@ -831,6 +957,7 @@ class XaiCliOAuthService:
                         "source_account_id": _clean_text(source.get("id")),
                         "email": _clean_text(source.get("email")),
                         "error": error[:500],
+                        "credential_acquired": credential_acquired,
                     }
                 )
 
@@ -923,6 +1050,17 @@ class XaiCliOAuthService:
         if not model_ids:
             raise UpstreamError("xAI CLI model discovery returned no models", status=502)
         return model_ids
+
+    async def _fetch_billing_quota(self, account: dict[str, Any]) -> dict[str, Any]:
+        async with self._client(proxy=self._proxy_for(account), timeout=30.0) as client:
+            response = await client.get(
+                f"{XAI_CLI_BASE_URL}/billing",
+                params={"format": "credits"},
+                headers=self._cli_headers(_clean_text(account.get("access_token"))),
+            )
+        if response.status_code != 200:
+            return {}
+        return _billing_quota(response)
 
     async def sync_models(self, account_id: str) -> dict[str, Any]:
         account = self._get_account(account_id)
@@ -1122,6 +1260,24 @@ class XaiCliOAuthService:
             if not content:
                 raise UpstreamError("xAI CLI account test returned no text", status=502)
 
+            quota: dict[str, Any] = {}
+            try:
+                quota = await self._fetch_billing_quota(account)
+            except Exception:
+                # A successful model request is authoritative even when the
+                # optional billing endpoint is temporarily unavailable.
+                quota = {}
+            self.store.update_probe_result(
+                account_id,
+                status="valid",
+                model=model_id,
+                http_status=response.status_code,
+                code="",
+                error="",
+                quota=quota,
+                usage=_response_probe_usage(response),
+                probed_at=datetime.now(timezone.utc).isoformat(),
+            )
             self.store.record_result(account_id, True)
             if _clean_text(account.get("status")).lower() not in {"active", "disabled"}:
                 self.store.set_status([account_id], "active")
@@ -1138,7 +1294,7 @@ class XaiCliOAuthService:
             raise
 
     async def probe_account(self, account_id: str, *, persist: bool = True) -> dict[str, Any]:
-        """Probe one OAuth account with the real model and persist safe quota headers."""
+        """Probe one OAuth account and persist its authoritative billing snapshot."""
         account = self._get_account(account_id)
         account_id = _clean_text(account.get("id"))
         probed_at = datetime.now(timezone.utc).isoformat()
@@ -1187,7 +1343,21 @@ class XaiCliOAuthService:
                 status = "invalid"
             else:
                 status = "unknown"
-            quota = _response_quota(response)
+            quota: dict[str, Any] = {}
+            if status in {"valid", "limited"} or (
+                response.status_code == 402 and _is_personal_team_blocked(code)
+            ):
+                try:
+                    quota = await self._fetch_billing_quota(account)
+                except Exception:
+                    # Billing telemetry must not override the model probe result.
+                    quota = {}
+            if not quota and response.status_code == 402 and _is_personal_team_blocked(code):
+                quota = {
+                    "source": "model_probe",
+                    "used_percent": 100.0,
+                    "remaining_percent": 0.0,
+                }
             usage = _response_probe_usage(response)
             return finish({
                 "account_id": account_id,

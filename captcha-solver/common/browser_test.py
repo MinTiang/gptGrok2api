@@ -56,6 +56,17 @@ class BrowserKwargsTest(unittest.TestCase):
 
         self.assertEqual(kwargs["proxy"], "http://10.0.0.8:8080")
 
+    def test_playwright_uses_supported_socks5_scheme_for_socks5h_proxy(self):
+        kwargs = browser_kwargs(
+            "XAI",
+            "socks5h://proxy-user:proxy-password@proxy.example.test:5000",
+        )
+
+        self.assertEqual(
+            kwargs["proxy"],
+            "socks5://proxy-user:proxy-password@proxy.example.test:5000",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

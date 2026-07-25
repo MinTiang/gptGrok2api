@@ -3031,6 +3031,10 @@ def _icloud_mailbox_result_claimed(*, success: bool, error: Exception | str | No
             "deleted or deactivated",
             "openaiemailalreadyregistered",
             "already registered",
+            "existing account found",
+            "account already exists",
+            "already exists",
+            "already in use",
             "已存在 gpt 账号",
         )
     )

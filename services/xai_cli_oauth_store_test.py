@@ -96,15 +96,22 @@ class XaiCliOAuthAccountStoreTest(unittest.TestCase):
             model="grok-4.5",
             http_status=200,
             quota={
-                "requests": {"limit": 21, "remaining": 20},
-                "tokens": {"limit": 1000000, "remaining": 999000},
+                "source": "billing",
+                "used_percent": 35,
+                "remaining_percent": 65,
+                "period": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-07-22T00:00:00+00:00",
+                    "end": "2026-07-29T00:00:00+00:00",
+                },
             },
             usage={"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
         )
 
         self.assertEqual(updated["status"], "disabled")
         self.assertEqual(updated["probe"]["status"], "valid")
-        self.assertEqual(updated["quota"]["requests"]["remaining"], 20)
+        self.assertEqual(updated["quota"]["remaining_percent"], 65.0)
+        self.assertEqual(updated["quota"]["period"]["end"], "2026-07-29T00:00:00+00:00")
         self.assertNotIn("access-one", repr(updated))
 
     def test_probe_batch_rewrites_account_file_once(self) -> None:

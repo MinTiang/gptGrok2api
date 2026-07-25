@@ -50,6 +50,13 @@ class ProtobufTest(unittest.TestCase):
 
 
 class GrpcWebTest(unittest.TestCase):
+    def test_browser_existing_account_message_is_mail_retryable(self) -> None:
+        self.assertTrue(
+            grok_protocol._looks_like_mail_error(
+                "Existing account found An account already exists which is associated with this email address."
+            )
+        )
+
     def test_parses_empty_message_and_success_trailer(self) -> None:
         body = grok_protocol.grpc_web_envelope(b"") + grok_protocol.grpc_web_envelope(
             b"grpc-status: 0\r\ngrpc-message: \r\n",
@@ -85,6 +92,46 @@ class GrpcWebTest(unittest.TestCase):
         self.addCleanup(client.close)
 
         self.assertFalse(client.session.trust_env)
+
+
+class LiveDeviceOAuthTest(unittest.TestCase):
+    def test_fresh_account_invalid_grant_retries_with_new_device_code(self) -> None:
+        from services.xai_device_oauth_protocol import XaiDeviceOAuthProtocolError
+
+        client = SimpleNamespace(
+            config={
+                "xai_cli_oauth_enabled": True,
+                "xai_cli_oauth_flow": "device",
+                "oauth_fresh_account_retry_delay": 7,
+            },
+            proxy="direct",
+            browser_session_id="browser-session",
+            browser_bridge=object(),
+        )
+        protocol = MagicMock()
+        protocol.authorize_browser_session.side_effect = [
+            XaiDeviceOAuthProtocolError("invalid_grant", stage="token", retryable=True),
+            {"access_token": "access-token"},
+        ]
+
+        with (
+            patch("services.xai_device_oauth_protocol.XaiDeviceOAuthProtocol", return_value=protocol) as protocol_type,
+            patch.object(grok_register.time, "sleep") as sleep,
+            patch.object(grok_register, "step") as step,
+            patch.object(grok_register, "debug_step") as debug_step,
+        ):
+            result = grok_register._authorize_live_oauth(
+                1,
+                client,
+                {"email": "person@example.com", "sso": "saved-sso"},
+            )
+            protocol_type.call_args.kwargs["progress"]("device_code", "创建 xAI Device Code")
+
+        self.assertEqual(result["access_token"], "access-token")
+        self.assertEqual(protocol.authorize_browser_session.call_count, 2)
+        sleep.assert_called_once_with(7)
+        self.assertTrue(all("person@example.com" in call.args[1] for call in step.call_args_list))
+        debug_step.assert_called_once_with(1, "创建 xAI Device Code：person@example.com")
 
 
 class LandingMetadataTest(unittest.TestCase):
@@ -224,6 +271,7 @@ class FlightTest(unittest.TestCase):
                     {
                         "signup_flow": "xconsole",
                         "xai_cli_pkce_reference_dir": str(reference_dir),
+                        "xconsole_reference_signup_enabled": True,
                     }
                 )
                 self.assertIs(client.session, observed["client"]._t._session)
@@ -248,13 +296,13 @@ class FlightTest(unittest.TestCase):
         self.assertEqual(observed["sso"], {"email": "", "password": "", "save": False, "retries": 3})
         self.assertTrue(observed["closed"])
 
-    def test_xconsole_defaults_to_cloud_console_signup_context(self) -> None:
+    def test_xconsole_defaults_to_grok_signup_context(self) -> None:
         client = grok_protocol.GrokProtocolClient({"signup_flow": "xconsole"})
         self.addCleanup(client.close)
 
         self.assertEqual(
             client.signup_url,
-            "https://accounts.x.ai/sign-up?redirect=cloud-console",
+            "https://accounts.x.ai/sign-up?redirect=grok-com",
         )
         self.assertEqual(client.session.headers["Sec-CH-UA-Platform"], '"Windows"')
         self.assertEqual(client.session.headers["Accept-Language"], "zh-CN,zh;q=0.9")
@@ -408,7 +456,7 @@ class FlightTest(unittest.TestCase):
 
         with (
             patch.object(client, "_prewarm_grok_session") as prewarm,
-            patch.object(client, "create_castle_token") as create_castle,
+            patch.object(client, "create_castle_token", return_value="castle-token") as create_castle,
             patch.object(client, "_server_action_request", return_value=response) as submit,
             patch.object(client, "_follow_signup_result", return_value=exchange),
         ):
@@ -423,10 +471,11 @@ class FlightTest(unittest.TestCase):
 
         payload = submit.call_args.args[0]
         self.assertEqual(payload["createUserAndSessionRequest"]["tosAcceptedVersion"], "$undefined")
-        self.assertEqual(payload["castleRequestToken"], "")
+        self.assertTrue(payload["promptOnDuplicateEmail"])
+        self.assertEqual(payload["castleRequestToken"], "castle-token")
         self.assertTrue(payload["conversionId"])
         prewarm.assert_not_called()
-        create_castle.assert_not_called()
+        create_castle.assert_called_once_with()
         self.assertEqual(result["sso"], "sso-token")
 
     def test_xconsole_email_and_password_rpcs_match_reference_sequence(self) -> None:
@@ -435,13 +484,13 @@ class FlightTest(unittest.TestCase):
         grpc_result = grok_protocol.GrpcWebResult((), {}, 0, "")
 
         with (
-            patch.object(client, "create_castle_token") as create_castle,
+            patch.object(client, "create_castle_token", return_value="castle-token") as create_castle,
             patch.object(client, "_grpc_post", return_value=grpc_result) as grpc_post,
         ):
             client.send_email_validation_code("user@example.com")
             client.validate_password("user@example.com", "Secret123!")
 
-        create_castle.assert_not_called()
+        create_castle.assert_called_once_with()
         self.assertEqual(
             [call.args[0] for call in grpc_post.call_args_list],
             [
@@ -451,7 +500,7 @@ class FlightTest(unittest.TestCase):
         )
         self.assertEqual(
             grok_protocol.parse_protobuf_fields(grpc_post.call_args_list[0].args[1]),
-            {1: [b"user@example.com"]},
+            {1: [b"user@example.com"], 3: [b"castle-token"]},
         )
 
     def test_reports_business_error_from_non_2xx_flight_response(self) -> None:
@@ -756,7 +805,12 @@ class TurnstileSolverTest(unittest.TestCase):
 
         def transport(url: str, payload: dict, headers: dict) -> dict:
             calls.append((url, payload, headers))
-            return {"solved": True, "token": "local-turnstile-token"}
+            return {
+                "solved": True,
+                "token": "local-turnstile-token",
+                "cookies": [{"name": "cf", "value": "solver-cookie", "domain": ".x.ai", "path": "/"}],
+                "user_agent": "Solver Browser UA",
+            }
 
         solver = grok_protocol.TurnstileSolver(
             {
@@ -773,6 +827,9 @@ class TurnstileSolverTest(unittest.TestCase):
             website_url="https://accounts.x.ai/sign-up?redirect=grok-com",
             sitekey="0x4AAAA-test",
             action="signup",
+            initial_cookies=[
+                {"name": "session", "value": "protocol-cookie", "domain": ".x.ai", "path": "/"}
+            ],
         )
 
         self.assertEqual(token, "local-turnstile-token")
@@ -784,7 +841,42 @@ class TurnstileSolverTest(unittest.TestCase):
         self.assertEqual(calls[0][1]["queue_timeout_s"], 25)
         self.assertEqual(calls[0][1]["concurrency"], 2)
         self.assertEqual(calls[0][1]["proxy"], "http://proxy.example.test:8080")
+        self.assertEqual(calls[0][1]["cookies"][0]["value"], "protocol-cookie")
+        self.assertEqual(solver.last_solution["user_agent"], "Solver Browser UA")
         self.assertNotIn("Authorization", calls[0][2])
+
+    def test_protocol_adopts_solver_cookies_and_browser_headers(self) -> None:
+        client = grok_protocol.GrokProtocolClient({"signup_flow": "xconsole"})
+        self.addCleanup(client.close)
+
+        client._adopt_turnstile_browser_state(
+            {
+                "cookies": [
+                    {
+                        "name": "cf_session",
+                        "value": "solver-cookie",
+                        "domain": ".x.ai",
+                        "path": "/",
+                        "secure": True,
+                    }
+                ],
+                "user_agent": "Solver Browser UA",
+                "language": "zh-CN",
+                "client_hints": {
+                    "sec_ch_ua": '\"Chromium\";v=\"146\"',
+                    "sec_ch_ua_mobile": "?0",
+                    "sec_ch_ua_platform": '\"Windows\"',
+                },
+                "page_state": {"url": "https://accounts.x.ai/sign-up"},
+            }
+        )
+
+        self.assertEqual(client.user_agent, "Solver Browser UA")
+        self.assertEqual(client.session.headers["User-Agent"], "Solver Browser UA")
+        self.assertEqual(client.session.headers["Sec-CH-UA"], '\"Chromium\";v=\"146\"')
+        self.assertEqual(client.session.headers["Accept-Language"], "zh-CN,zh;q=0.9")
+        self.assertEqual(client.session.cookies.get("cf_session", domain=".x.ai"), "solver-cookie")
+        self.assertEqual(client._solver_page_state["url"], "https://accounts.x.ai/sign-up")
 
     def test_local_solver_retries_unsolved_browser_attempt(self) -> None:
         calls: list[dict] = []
@@ -946,6 +1038,69 @@ class GrokWorkerTest(unittest.TestCase):
         self.assertEqual(source, "runtime")
         self.assertEqual(grok_register._mail_config(proxy)["proxy"], proxy)
 
+    def test_zooproxy_gets_a_fresh_sticky_sid_for_each_task(self) -> None:
+        profile = SimpleNamespace(
+            proxy_url=(
+                "socks5h://proxy-user-region-US-sid-shared123-t-10:proxy-password"
+                "@us-eu.zooproxy.example:5000"
+            ),
+            proxy_source="explicit",
+        )
+        with patch.object(grok_register.proxy_settings, "get_profile", return_value=profile), patch.object(
+            grok_register.secrets,
+            "token_hex",
+            side_effect=["task0001", "task0002"],
+        ):
+            first_proxy, first_source = grok_register._resolve_register_proxy(profile.proxy_url)
+            second_proxy, second_source = grok_register._resolve_register_proxy(profile.proxy_url)
+
+        self.assertIn("-sid-task0001-t-10", first_proxy)
+        self.assertIn("-sid-task0002-t-10", second_proxy)
+        self.assertNotEqual(first_proxy, second_proxy)
+        self.assertEqual(first_source, "explicit_task_sid")
+        self.assertEqual(second_source, "explicit_task_sid")
+
+    def test_task_sid_rotation_does_not_change_other_proxy_urls(self) -> None:
+        proxy = "socks5h://proxy-user:proxy-password@proxy.example.test:5000"
+
+        self.assertEqual(
+            grok_register._task_scoped_proxy(proxy, session_id="task0001"),
+            proxy,
+        )
+
+    @patch.object(grok_register, "_register_once")
+    @patch.object(grok_register, "GrokProtocolClient")
+    def test_mail_retry_starts_a_fresh_protocol_client(
+        self,
+        client_type: MagicMock,
+        register_once: MagicMock,
+    ) -> None:
+        grok_register.config["grok"] = {
+            "max_mail_retries": 2,
+            "provider": "yescaptcha",
+            "api_key": "key",
+        }
+        first_client = MagicMock()
+        second_client = MagicMock()
+        client_type.side_effect = [first_client, second_client]
+        register_once.side_effect = [
+            grok_protocol.GrokProtocolError(
+                "Existing account found An account already exists",
+                stage="create_account",
+                mail_retryable=True,
+            ),
+            {"email": "fresh@icloud.example", "sso": "sso-token"},
+        ]
+
+        result = grok_register.worker(1)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(client_type.call_count, 2)
+        self.assertIs(register_once.call_args_list[0].args[1], first_client)
+        self.assertIs(register_once.call_args_list[1].args[1], second_client)
+        first_client.close.assert_called_once_with()
+        second_client.close.assert_called_once_with()
+
     @patch.object(grok_register, "GrokProtocolClient")
     @patch.object(grok_register.mail_provider, "mark_mailbox_result")
     @patch.object(grok_register.mail_provider, "wait_for_code", return_value="  AB-C 123  ")
@@ -969,6 +1124,16 @@ class GrokWorkerTest(unittest.TestCase):
             "redirect_url": "https://grok.com/",
         }
         client.session_cookies.return_value = {"sso": "sso-token", "session": "live-cookie"}
+        client.session_cookie_jar.return_value = [
+            {
+                "name": "sso",
+                "value": "sso-token",
+                "domain": ".x.ai",
+                "path": "/",
+                "secure": True,
+                "httpOnly": True,
+            }
+        ]
 
         log_messages: list[str] = []
         with patch.object(
@@ -985,6 +1150,7 @@ class GrokWorkerTest(unittest.TestCase):
             result["result"]["oauth_session_cookies"],
             {"sso": "sso-token", "session": "live-cookie"},
         )
+        self.assertEqual(result["result"]["oauth_cookie_jar"][0]["domain"], ".x.ai")
         self.assertEqual(result["result"]["source_type"], "protocol")
         client.verify_email_validation_code.assert_called_once_with(
             "relay@icloud.example",
@@ -995,14 +1161,15 @@ class GrokWorkerTest(unittest.TestCase):
             [
                 "[任务1] 准备注册环境",
                 "[任务1] 获取注册邮箱",
-                "[任务1] 验证码已发送，等待邮件",
-                "[任务1] 邮箱验证完成，正在进行安全校验",
-                "[任务1] 安全校验完成，正在创建账号",
+                "[任务1] 注册邮箱已获取：relay@icloud.example",
+                "[任务1] 验证码已发送，等待邮件：relay@icloud.example",
+                "[任务1] 邮箱验证完成，正在进行安全校验：relay@icloud.example",
+                "[任务1] 安全校验完成，正在创建账号：relay@icloud.example",
             ],
         )
-        self.assertRegex(log_messages[-1], r"^\[任务1\] 注册成功（\d+\.\d 秒）$")
+        self.assertRegex(log_messages[-1], r"^\[任务1\] 注册成功（\d+\.\d 秒）：relay@icloud\.example$")
         self.assertNotIn("AB-C 123", "\n".join(log_messages))
-        self.assertNotIn("relay@icloud.example", "\n".join(log_messages))
+        self.assertIn("relay@icloud.example", "\n".join(log_messages))
         call_names = [call[0] for call in client.method_calls]
         self.assertLess(call_names.index("verify_email_validation_code"), call_names.index("solve_turnstile"))
         self.assertLess(call_names.index("validate_password"), call_names.index("solve_turnstile"))

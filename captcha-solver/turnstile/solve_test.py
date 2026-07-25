@@ -50,6 +50,18 @@ class TurnstileWaitTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(solve._concurrency_limit(7), 7)
         self.assertEqual(solve._concurrency_limit(99), 64)
 
+    def test_scoped_browser_cookies_only_keeps_target_domain(self):
+        cookies = solve._scoped_browser_cookies(
+            [
+                {"name": "xai", "value": "one", "domain": ".x.ai", "path": "/"},
+                {"name": "other", "value": "two", "domain": ".example.com", "path": "/"},
+            ],
+            "https://accounts.x.ai/sign-up",
+        )
+
+        self.assertEqual([item["name"] for item in cookies], ["xai"])
+        self.assertEqual(cookies[0]["domain"], ".x.ai")
+
     async def test_zero_concurrency_bypasses_shared_slot_limit(self):
         solve._active_solves = 100
 

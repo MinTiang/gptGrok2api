@@ -3,15 +3,22 @@ import apiClient from '@/api/client'
 export type GrokOAuthAccountStatus = 'active' | 'disabled' | 'expired' | 'invalid'
 export type GrokOAuthProbeStatus = 'valid' | 'limited' | 'invalid' | 'unknown'
 
-export type GrokOAuthQuotaWindow = {
-  limit?: number
-  remaining?: number
-  reset?: string
+export type GrokOAuthProductUsage = {
+  product: string
+  used_percent?: number
+  remaining_percent?: number
 }
 
 export type GrokOAuthQuota = {
-  requests?: GrokOAuthQuotaWindow
-  tokens?: GrokOAuthQuotaWindow
+  source?: 'billing' | 'model_probe'
+  used_percent?: number
+  remaining_percent?: number
+  period?: {
+    type?: string
+    start?: string
+    end?: string
+  }
+  product_usage?: GrokOAuthProductUsage[]
   updated_at?: string
 }
 

@@ -102,6 +102,7 @@ export type GrokOAuthDeliveryConfig = {
 
 export type GrokRegisterConfig = {
   signup_flow: 'xconsole' | 'legacy' | string
+  browser_flow_enabled: boolean
   provider: GrokTurnstileProvider | string
   api_key: string
   api_base: string

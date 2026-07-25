@@ -7,13 +7,14 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
-from services.xai_cli_oauth_service import XaiCliOAuthService
+from services.xai_cli_oauth_service import XaiCliOAuthService, _billing_quota
 from services.xai_cli_oauth_store import XaiCliOAuthAccountStore
 
 
@@ -26,7 +27,7 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.store = XaiCliOAuthAccountStore(Path(self.temp_dir.name) / "accounts.json")
-        self.service = XaiCliOAuthService(self.store)
+        self.service = XaiCliOAuthService(self.store, initial_probe_delay_seconds=0)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -42,6 +43,36 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
                 "models": ["grok-4.5"],
             }
         )["item"]
+
+    def test_billing_quota_treats_omitted_proto_percent_as_zero_used(self) -> None:
+        response = httpx.Response(
+            200,
+            json={
+                "config": {
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "start": "2026-07-22T00:00:00+00:00",
+                        "end": "2026-07-29T00:00:00+00:00",
+                    }
+                },
+                "productUsage": [],
+            },
+        )
+
+        quota = _billing_quota(response)
+
+        self.assertEqual(quota["source"], "billing")
+        self.assertEqual(quota["used_percent"], 0.0)
+        self.assertEqual(quota["remaining_percent"], 100.0)
+        self.assertEqual(quota["period"]["end"], "2026-07-29T00:00:00+00:00")
+
+    def test_protocol_initial_probe_delay_defaults_to_five_seconds(self) -> None:
+        service = XaiCliOAuthService(self.store)
+
+        self.assertEqual(service.initial_probe_delay_seconds, 5)
+
+    def test_billing_quota_rejects_unrelated_success_payload(self) -> None:
+        self.assertEqual(_billing_quota(httpx.Response(200, json={"ok": True})), {})
 
     async def test_import_validates_models_and_gates_catalog(self) -> None:
         access = _jwt({"sub": "subject-import", "email": "import@example.com", "exp": int(time.time()) + 3600})
@@ -84,6 +115,15 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
             "email": "source@example.com",
             "password": "source-password",
             "sso": "source-sso",
+            "oauth_cookie_jar": [
+                {
+                    "name": "cf_clearance",
+                    "value": "clearance-cookie",
+                    "domain": "accounts.x.ai",
+                    "path": "/",
+                    "secure": True,
+                }
+            ],
             "status": "active",
         }
         credential = {
@@ -130,10 +170,12 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
             email="source@example.com",
             password="source-password",
             sso="source-sso",
+            session_cookie_jar=source["oauth_cookie_jar"],
         )
         self.assertEqual(self.store.list_accounts()[0]["source_type"], "registered_account_protocol")
         self.assertEqual(events[-1]["job_id"], job_id)
         self.assertEqual(events[-1]["oauth_account_id"], self.store.list_accounts()[0]["id"])
+        self.assertEqual(events[-1]["probe"], {"status": "valid"})
 
     async def test_protocol_spending_limit_waits_without_external_delivery(self) -> None:
         source = {
@@ -186,6 +228,7 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["status"], "authorized")
         self.assertEqual(job["stage"], "permission_pending")
         self.assertEqual(events[-1]["status"], "permission_pending")
+        self.assertEqual(events[-1]["probe"]["http_status"], 402)
         deliver.assert_not_called()
 
     async def test_protocol_can_use_reference_pkce_flow(self) -> None:
@@ -194,6 +237,15 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
             "email": "pkce@example.com",
             "password": "source-password",
             "sso": "source-sso",
+            "oauth_cookie_jar": [
+                {
+                    "name": "cf_clearance",
+                    "value": "clearance-cookie",
+                    "domain": "accounts.x.ai",
+                    "path": "/",
+                    "secure": True,
+                }
+            ],
         }
         session_cookies = {"sso": "source-sso", "session": "live-cookie"}
         credential = {
@@ -244,6 +296,7 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
             password="source-password",
             sso="source-sso",
             session_cookies=session_cookies,
+            session_cookie_jar=source["oauth_cookie_jar"],
         )
 
     async def test_preauthorized_registration_skips_second_protocol_login(self) -> None:
@@ -598,6 +651,24 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved, "socks5h://proxy.example:1080")
         get_profile.assert_called_once_with(proxy="", upstream=True)
 
+    def test_fresh_protocol_account_waits_before_device_code(self) -> None:
+        source = {"created_at": "2030-01-01T00:00:00+00:00"}
+        created = datetime.fromisoformat(source["created_at"]).timestamp()
+
+        delay = self.service._fresh_account_oauth_delay_seconds(
+            source,
+            {"oauth_fresh_account_retry_delay": 15},
+            now=created + 4,
+        )
+        settled = self.service._fresh_account_oauth_delay_seconds(
+            source,
+            {"oauth_fresh_account_retry_delay": 15},
+            now=created + 20,
+        )
+
+        self.assertEqual(delay, 11)
+        self.assertEqual(settled, 0)
+
     async def test_refresh_rotates_token_without_returning_credentials(self) -> None:
         account = self._account(expires_at="2000-01-01T00:00:00+00:00")
         access = _jwt({"sub": "subject-person", "email": "person@example.com", "exp": int(time.time()) + 3600})
@@ -650,10 +721,27 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
         )["item"]
         upstream = httpx.Response(
             200,
-            json={"id": "resp_test", "output": [{"type": "message", "content": [{"type": "output_text", "text": "OK"}]}]},
+            json={
+                "id": "resp_test",
+                "usage": {"input_tokens": 10, "output_tokens": 1, "total_tokens": 11},
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "OK"}]}],
+            },
         )
+        self.store.update_probe_result(
+            second["id"],
+            status="invalid",
+            model="grok-4.5",
+            http_status=403,
+            code="permission-denied",
+            error="permission pending",
+        )
+        billing_quota = {"source": "billing", "used_percent": 0.0, "remaining_percent": 100.0}
 
-        with patch.object(self.service, "_post_response", new=AsyncMock(return_value=upstream)) as post_response:
+        with patch.object(self.service, "_post_response", new=AsyncMock(return_value=upstream)) as post_response, patch.object(
+            self.service,
+            "_fetch_billing_quota",
+            new=AsyncMock(return_value=billing_quota),
+        ):
             result = await self.service.test_account(str(second["id"]), model="grok-4.5", prompt="只回复 OK")
 
         self.assertEqual(result["account_id"], second["id"])
@@ -662,17 +750,38 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
         by_id = {item["id"]: item for item in self.store.list_accounts()}
         self.assertEqual(by_id[first["id"]]["use_count"], 0)
         self.assertEqual(by_id[second["id"]]["use_count"], 1)
+        self.assertEqual(by_id[second["id"]]["status"], "active")
+        self.assertEqual(by_id[second["id"]]["probe"]["status"], "valid")
+        self.assertEqual(by_id[second["id"]]["probe"]["http_status"], 200)
+        self.assertEqual(by_id[second["id"]]["probe"]["usage"]["total_tokens"], 11)
+        self.assertEqual(by_id[second["id"]]["quota"]["remaining_percent"], 100.0)
 
-    async def test_background_probe_persists_grok_45_quota_without_counting_user_traffic(self) -> None:
+    async def test_successful_account_test_stays_valid_when_billing_probe_fails(self) -> None:
         account = self._account()
         upstream = httpx.Response(
             200,
-            headers={
-                "x-ratelimit-limit-requests": "21",
-                "x-ratelimit-remaining-requests": "20",
-                "x-ratelimit-limit-tokens": "1000000",
-                "x-ratelimit-remaining-tokens": "999786",
+            json={
+                "id": "resp_test",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "OK"}]}],
             },
+        )
+
+        with patch.object(self.service, "_post_response", new=AsyncMock(return_value=upstream)), patch.object(
+            self.service,
+            "_fetch_billing_quota",
+            new=AsyncMock(side_effect=RuntimeError("billing unavailable")),
+        ):
+            result = await self.service.test_account(str(account["id"]), model="grok-4.5", prompt="只回复 OK")
+
+        self.assertEqual(result["content"], "OK")
+        saved = self.store.get(str(account["id"]), redacted=True)
+        self.assertEqual(saved["probe"]["status"], "valid")
+        self.assertEqual(saved["probe"]["http_status"], 200)
+
+    async def test_background_probe_persists_billing_quota_without_counting_user_traffic(self) -> None:
+        account = self._account()
+        upstream = httpx.Response(
+            200,
             json={
                 "id": "resp_probe",
                 "usage": {"input_tokens": 196, "output_tokens": 18, "total_tokens": 214},
@@ -680,15 +789,29 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        with patch.object(self.service, "_post_response", new=AsyncMock(return_value=upstream)):
+        billing_quota = {
+            "source": "billing",
+            "used_percent": 35.0,
+            "remaining_percent": 65.0,
+            "period": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "start": "2026-07-22T00:00:00+00:00",
+                "end": "2026-07-29T00:00:00+00:00",
+            },
+        }
+        with patch.object(self.service, "_post_response", new=AsyncMock(return_value=upstream)), patch.object(
+            self.service,
+            "_fetch_billing_quota",
+            new=AsyncMock(return_value=billing_quota),
+        ):
             result = await self.service.probe_account(str(account["id"]))
 
         self.assertEqual(result["status"], "valid")
         saved = self.store.get(str(account["id"]), redacted=True)
         self.assertEqual(saved["probe"]["model"], "grok-4.5")
         self.assertEqual(saved["probe"]["usage"]["total_tokens"], 214)
-        self.assertEqual(saved["quota"]["requests"], {"limit": 21, "remaining": 20})
-        self.assertEqual(saved["quota"]["tokens"], {"limit": 1000000, "remaining": 999786})
+        self.assertEqual(saved["quota"]["remaining_percent"], 65.0)
+        self.assertEqual(saved["quota"]["period"]["end"], "2026-07-29T00:00:00+00:00")
         self.assertEqual(saved["use_count"], 0)
         self.assertEqual(saved["fail_count"], 0)
 
@@ -704,7 +827,11 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        with patch.object(self.service, "_post_response", new=AsyncMock(return_value=upstream)):
+        with patch.object(self.service, "_post_response", new=AsyncMock(return_value=upstream)), patch.object(
+            self.service,
+            "_fetch_billing_quota",
+            new=AsyncMock(return_value={}),
+        ):
             result = await self.service.probe_account(str(account["id"]))
 
         self.assertEqual(result["status"], "invalid")
@@ -712,6 +839,7 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved["status"], "invalid")
         self.assertEqual(saved["probe"]["http_status"], 402)
         self.assertEqual(saved["probe"]["code"], "personal-team-blocked:spending-limit")
+        self.assertEqual(saved["quota"]["remaining_percent"], 0.0)
 
     async def test_sync_models_delivers_account_after_delayed_probe_becomes_valid(self) -> None:
         account = self._account()

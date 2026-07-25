@@ -43,7 +43,20 @@ class GrokAccountStoreTest(unittest.TestCase):
 
     def test_redacted_list_never_exposes_credentials(self) -> None:
         self.store.upsert(
-            {"email": "secret@example.com", "password": "plain-password", "sso": "plain-sso-token"}
+            {
+                "email": "secret@example.com",
+                "password": "plain-password",
+                "sso": "plain-sso-token",
+                "oauth_cookie_jar": [
+                    {
+                        "name": "cf_clearance",
+                        "value": "plain-clearance-cookie",
+                        "domain": "accounts.x.ai",
+                        "path": "/",
+                        "secure": True,
+                    }
+                ],
+            }
         )
 
         redacted = self.store.list_accounts(redacted=True)
@@ -52,8 +65,12 @@ class GrokAccountStoreTest(unittest.TestCase):
         self.assertEqual(redacted[0]["email"], "se***t@example.com")
         self.assertTrue(redacted[0]["has_password"])
         self.assertTrue(redacted[0]["has_sso"])
+        self.assertTrue(redacted[0]["has_oauth_cookie_jar"])
         self.assertNotIn("plain-password", repr(redacted))
         self.assertNotIn("plain-sso-token", repr(redacted))
+        self.assertNotIn("plain-clearance-cookie", repr(redacted))
+        stored = self.store.list_accounts(redacted=False)[0]
+        self.assertEqual(stored["oauth_cookie_jar"][0]["domain"], "accounts.x.ai")
 
     def test_concurrent_writes_are_not_lost(self) -> None:
         def save(index: int) -> None:

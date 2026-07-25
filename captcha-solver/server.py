@@ -210,6 +210,8 @@ class SolveRequest(BaseModel):
     concurrency: Optional[int] = Field(
         None, ge=0, le=64, description="Turnstile-only maximum simultaneous browser attempts. "
         "Use 0 for unlimited; otherwise overrides TURNSTILE_CONCURRENCY.")
+    cookies: Optional[list[dict[str, Any]]] = Field(
+        None, description="Browser cookies to restore before real-page navigation.")
 
     # reCAPTCHA-only
     version: Optional[str] = Field(None, description="reCAPTCHA only: v2 | v3 | invisible (default v2).")
@@ -230,6 +232,41 @@ class SolveRequest(BaseModel):
 
     # perimeterx-only (HUMAN/PerimeterX 'Press & Hold')
     render_flow: Optional[str] = Field(None, description="perimeterx: named site trigger that makes the gate render when it doesn't show on plain load (default 'outlook_signup'). Throwaway navigation only — NOT account creation. Pass null with a `url` for deployments whose gate renders on goto(). Harvests the _px3 clearance cookie (bound to _pxvid+IP+UA; replay under the same proxy+UA within TTL).")
+
+
+class XaiSessionStartRequest(BaseModel):
+    signup_url: str = "https://accounts.x.ai/sign-up?redirect=grok-com"
+    proxy: Optional[str] = None
+    timeout_s: int = Field(120, ge=15, le=180)
+
+
+class XaiSessionEmailRequest(BaseModel):
+    session_id: str
+    email: str
+
+
+class XaiSessionVerifyRequest(XaiSessionEmailRequest):
+    code: str
+
+
+class XaiSessionSignupRequest(XaiSessionVerifyRequest):
+    password: str
+    given_name: str
+    family_name: str
+    turnstile_token: str
+    action_id: str
+    next_router_state_tree: str
+
+
+class XaiSessionAuthorizeRequest(BaseModel):
+    session_id: str
+    verification_url: str
+    user_code: str
+    timeout_s: int = Field(120, ge=15, le=600)
+
+
+class XaiSessionCloseRequest(BaseModel):
+    session_id: str
 
 
 # Named request examples → Swagger UI renders these as a dropdown picker on /solve.
@@ -344,6 +381,102 @@ async def health():
     return {"status": "ok", "supported_types": SUPPORTED}
 
 
+def _xai_http_error(error: Exception) -> HTTPException:
+    from xai_browser.flow import XaiBrowserFlowError
+
+    if isinstance(error, XaiBrowserFlowError):
+        status = 409 if error.stage in {"browser_session", "cookie_setter", "approve"} else 400
+        if error.retryable:
+            status = 503
+        return HTTPException(status, detail=str(error))
+    return HTTPException(500, detail=f"xAI browser flow failed: {type(error).__name__}")
+
+
+@app.post("/xai/session/start", dependencies=[Depends(_bearer)], tags=["solve"])
+async def xai_session_start(req: XaiSessionStartRequest):
+    from xai_browser.flow import start_session
+
+    _assert_public_url(req.signup_url, "signup_url")
+    try:
+        return await start_session(
+            signup_url=req.signup_url,
+            proxy=req.proxy or "",
+            timeout_s=req.timeout_s,
+        )
+    except Exception as error:
+        raise _xai_http_error(error) from error
+
+
+@app.post("/xai/session/send-email", dependencies=[Depends(_bearer)], tags=["solve"])
+async def xai_session_send_email(req: XaiSessionEmailRequest):
+    from xai_browser.flow import send_email
+
+    try:
+        return await send_email(req.session_id, req.email)
+    except Exception as error:
+        raise _xai_http_error(error) from error
+
+
+@app.post("/xai/session/verify-email", dependencies=[Depends(_bearer)], tags=["solve"])
+async def xai_session_verify_email(req: XaiSessionVerifyRequest):
+    from xai_browser.flow import verify_email
+
+    try:
+        return await verify_email(req.session_id, req.email, req.code)
+    except Exception as error:
+        raise _xai_http_error(error) from error
+
+
+@app.post("/xai/session/signup", dependencies=[Depends(_bearer)], tags=["solve"])
+async def xai_session_signup(req: XaiSessionSignupRequest):
+    from xai_browser.flow import signup
+
+    try:
+        return await signup(
+            req.session_id,
+            email=req.email,
+            password=req.password,
+            code=req.code,
+            given_name=req.given_name,
+            family_name=req.family_name,
+            turnstile_token=req.turnstile_token,
+            action_id=req.action_id,
+            next_router_state_tree=req.next_router_state_tree,
+        )
+    except Exception as error:
+        raise _xai_http_error(error) from error
+
+
+@app.post("/xai/session/authorize-device", dependencies=[Depends(_bearer)], tags=["solve"])
+async def xai_session_authorize_device(req: XaiSessionAuthorizeRequest):
+    from xai_browser.flow import authorize_device
+
+    _assert_public_url(req.verification_url, "verification_url")
+    try:
+        return await authorize_device(
+            req.session_id,
+            verification_url=req.verification_url,
+            user_code=req.user_code,
+            timeout_s=req.timeout_s,
+        )
+    except Exception as error:
+        raise _xai_http_error(error) from error
+
+
+@app.post("/xai/session/close", dependencies=[Depends(_bearer)], tags=["solve"])
+async def xai_session_close(req: XaiSessionCloseRequest):
+    from xai_browser.flow import close_session
+
+    return {"ok": True, "closed": await close_session(req.session_id)}
+
+
+@app.on_event("shutdown")
+async def close_xai_browser_sessions():
+    from xai_browser.flow import close_all_sessions
+
+    await close_all_sessions()
+
+
 def _extract(req: SolveRequest):
     """Unpack pre_actions + post_fetch for realpage endpoints."""
     actions = [a.model_dump() for a in req.pre_actions] if req.pre_actions else None
@@ -371,7 +504,8 @@ async def _dispatch(req: SolveRequest) -> dict:
                 actions, fetches = _extract(req)
                 r = await solve_turnstile_realpage(
                     req.url, req.sitekey, req.timeout_s, actions, fetches, req.proxy,
-                    req.action, req.cdata, req.concurrency, req.queue_timeout_s)
+                    req.action, req.cdata, req.concurrency, req.queue_timeout_s,
+                    req.cookies)
             else:
                 r = await solve_turnstile(
                     req.sitekey, req.url, req.action, req.cdata, req.proxy,

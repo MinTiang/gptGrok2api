@@ -5,6 +5,7 @@ from typing import Any
 
 from services.account_service import account_service
 from services.grok_runtime import grok_runtime
+from services.register.grok_account_store import grok_account_store
 from services.xai_cli_oauth_store import xai_cli_oauth_store
 
 
@@ -87,11 +88,8 @@ def _oauth_stats(items: object) -> dict[str, Any]:
         bucket = "limited" if probe_status == "limited" else "active"
         statuses[bucket] += 1
         quota = item.get("quota") if isinstance(item.get("quota"), dict) else {}
-        requests = quota.get("requests") if isinstance(quota.get("requests"), dict) else {}
-        if requests.get("remaining") is None:
+        if quota.get("remaining_percent") is None:
             unknown_quota_count += 1
-        else:
-            total_quota += _number(requests.get("remaining"))
     return {
         "total": len(records),
         "cumulative_total": len(records),
@@ -144,12 +142,38 @@ async def _load_grok_runtime_stats() -> dict[str, Any]:
         return _empty("grok_runtime", source_available=False)
 
 
-async def _load_grok_oauth_stats() -> dict[str, Any]:
+def _runtime_linked_emails(items: object) -> set[str]:
+    records = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+    linked: set[str] = set()
+    for item in records:
+        runtime = item.get("runtime") if isinstance(item.get("runtime"), dict) else {}
+        email = str(item.get("email") or "").strip().lower()
+        if email and runtime and runtime.get("present") is not False:
+            linked.add(email)
+    return linked
+
+
+async def _load_grok_oauth_stats() -> tuple[dict[str, Any], dict[str, Any]]:
     try:
-        items = await asyncio.to_thread(xai_cli_oauth_store.list_accounts, redacted=True)
-        return _normalize(_oauth_stats(items), "grok_oauth")
+        items, registered = await asyncio.gather(
+            asyncio.to_thread(xai_cli_oauth_store.list_accounts, redacted=False),
+            asyncio.to_thread(grok_account_store.list_accounts, redacted=False),
+        )
+        linked_emails = _runtime_linked_emails(registered)
+        unlinked_items = [
+            item
+            for item in items
+            if str(item.get("email") or "").strip().lower() not in linked_emails
+        ]
+        return (
+            _normalize(_oauth_stats(items), "grok_oauth"),
+            _normalize(_oauth_stats(unlinked_items), "grok_oauth_unlinked"),
+        )
     except Exception:
-        return _empty("grok_oauth", source_available=False)
+        return (
+            _empty("grok_oauth", source_available=False),
+            _empty("grok_oauth_unlinked", source_available=False),
+        )
 
 
 async def _load_with_timeout(loader: Any, provider: str) -> dict[str, Any]:
@@ -160,12 +184,31 @@ async def _load_with_timeout(loader: Any, provider: str) -> dict[str, Any]:
 
 
 async def get_provider_account_stats() -> dict[str, Any]:
-    gpt, grok_runtime_stats, grok_oauth = await asyncio.gather(
+    gpt, grok_runtime_stats, grok_oauth_breakdown = await asyncio.gather(
         _load_with_timeout(_load_gpt_stats, "gpt"),
         _load_with_timeout(_load_grok_runtime_stats, "grok_runtime"),
         _load_with_timeout(_load_grok_oauth_stats, "grok_oauth"),
     )
-    grok = _aggregate("grok", {"runtime": grok_runtime_stats, "oauth": grok_oauth})
+    if isinstance(grok_oauth_breakdown, tuple) and len(grok_oauth_breakdown) == 2:
+        grok_oauth, grok_oauth_unlinked = grok_oauth_breakdown
+    else:
+        grok_oauth = _empty("grok_oauth", source_available=False)
+        grok_oauth_unlinked = _empty("grok_oauth_unlinked", source_available=False)
+    oauth_for_logical_accounts = (
+        grok_oauth_unlinked if grok_runtime_stats.get("source_available") else grok_oauth
+    )
+    grok = _aggregate(
+        "grok",
+        {"runtime": grok_runtime_stats, "oauth": oauth_for_logical_accounts},
+    )
+    # Usage counters belong to each credential path and are not account counts.
+    # Retain linked OAuth traffic even though the logical account is counted once.
+    grok["total_success"] = _number(grok_runtime_stats.get("total_success")) + _number(
+        grok_oauth.get("total_success")
+    )
+    grok["total_fail"] = _number(grok_runtime_stats.get("total_fail")) + _number(
+        grok_oauth.get("total_fail")
+    )
     total = _aggregate("all", {"gpt": gpt, "grok": grok})
     total["providers"] = {
         "gpt": gpt,

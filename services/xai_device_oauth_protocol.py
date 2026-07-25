@@ -1,8 +1,8 @@
-"""Headless xAI Device Code authorization using a saved Grok session or login.
+"""xAI Device Code authorization using a live browser or saved Grok login.
 
-An existing SSO session is tried first.  If it cannot reach the device consent
-form, the protocol falls back to password login with the existing Castle/jsdom
-runtime and Turnstile provider, so neither path requires a browser page.
+Saved SSO and password-login sessions use xAI's direct device verify/approve
+endpoints, with the legacy consent form kept only as a compatibility fallback.
+Fresh registrations can reuse the browser context that completed registration.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 
 from services.register.grok_protocol import (
     GrokProtocolClient,
@@ -26,6 +26,7 @@ from services.xai_cli_oauth_protocol import (
     XAI_OAUTH_SCOPE,
     XAI_TOKEN_URL,
 )
+from services.xai_session_cookies import apply_cookie_jar, flatten_cookie_jar
 
 
 _DEVICE_VERIFY_URL = "https://auth.x.ai/oauth2/device/verify"
@@ -114,6 +115,33 @@ def _is_device_authorized_body(value: object) -> bool:
         marker in body
         for marker in ("device authorized", "设备已授权", "you have authorized", "device is authorized")
     )
+
+
+def _oauth_response_error(response: Any) -> str:
+    payload: dict[str, Any] = {}
+    try:
+        candidate = response.json()
+        if isinstance(candidate, dict):
+            payload = candidate
+    except Exception:
+        pass
+    error = _clean_text(payload.get("error"))
+    description = _clean_text(payload.get("error_description"))
+    if error:
+        return f"{error}: {description}" if description else error
+
+    body = _clean_text(getattr(response, "text", "")).lower()
+    for marker in (
+        "access_denied",
+        "authorization_declined",
+        "expired_token",
+        "invalid_grant",
+        "invalid_request",
+        "unauthorized_client",
+    ):
+        if marker in body:
+            return marker
+    return ""
 
 
 def _approval_completed(client: GrokProtocolClient, response: Any, *, referer: str) -> bool:
@@ -450,6 +478,235 @@ class XaiDeviceOAuthProtocol:
             stage=stage,
         )
 
+    @staticmethod
+    def _approve_device_direct(client: GrokProtocolClient, user_code: str, *, stage: str) -> tuple[bool, str]:
+        """Use the current xAI verify/approve endpoints without parsing consent HTML."""
+        verify = client._request(
+            "POST",
+            _DEVICE_VERIFY_URL,
+            data={"user_code": user_code},
+            headers={"Accept": "text/html,application/xhtml+xml", "Content-Type": "application/x-www-form-urlencoded"},
+            allow_redirects=False,
+        )
+        verify_error = _oauth_response_error(verify)
+        if verify_error:
+            raise XaiDeviceOAuthProtocolError(
+                f"xAI device verification failed: {verify_error}",
+                stage=stage,
+                retryable=getattr(verify, "status_code", 0) >= 500,
+            )
+        if getattr(verify, "status_code", 0) in {401, 403}:
+            raise XaiDeviceOAuthProtocolError("xAI device verification rejected the login session", stage=stage)
+
+        location = _clean_text(getattr(verify, "headers", {}).get("location"))
+        if not location:
+            raise XaiDeviceOAuthProtocolError(
+                "xAI device verification did not return a navigation target",
+                stage=stage,
+                retryable=True,
+            )
+        consent_url = _validated_url(
+            urljoin(str(getattr(verify, "url", "") or _DEVICE_VERIFY_URL), location),
+            hosts=_ACCOUNT_NAVIGATION_HOSTS,
+            stage=stage,
+        )
+        if _is_sign_in_url(consent_url):
+            raise XaiDeviceOAuthProtocolError("xAI device verification returned to sign-in", stage=stage)
+        if _is_device_done_url(consent_url) or _is_device_authorized_body(getattr(verify, "text", "")):
+            return True, consent_url
+
+        approve = client._request(
+            "POST",
+            _DEVICE_APPROVE_URL,
+            data={
+                "user_code": user_code,
+                "action": "allow",
+                "principal_type": "User",
+                "principal_id": "",
+            },
+            headers={
+                "Accept": "text/html,application/xhtml+xml",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://accounts.x.ai",
+                "Referer": consent_url,
+            },
+            allow_redirects=False,
+        )
+        approve_error = _oauth_response_error(approve)
+        if approve_error:
+            raise XaiDeviceOAuthProtocolError(f"xAI device approval failed: {approve_error}", stage="approve")
+
+        status = int(getattr(approve, "status_code", 0) or 0)
+        approve_location = _clean_text(getattr(approve, "headers", {}).get("location"))
+        if approve_location:
+            next_url = _validated_url(
+                urljoin(str(getattr(approve, "url", "") or _DEVICE_APPROVE_URL), approve_location),
+                hosts=_ACCOUNT_NAVIGATION_HOSTS,
+                stage="approve",
+            )
+            if _is_sign_in_url(next_url):
+                raise XaiDeviceOAuthProtocolError("xAI device approval returned to sign-in", stage="approve")
+            if status in {301, 302, 303, 307, 308}:
+                return True, consent_url
+        if _is_device_authorized_body(getattr(approve, "text", "")) or 200 <= status < 300:
+            return True, consent_url
+        if status in {400, 404, 405, 422}:
+            return False, consent_url
+        if status in {401, 403}:
+            raise XaiDeviceOAuthProtocolError("xAI rejected the device approval session", stage="approve")
+        raise XaiDeviceOAuthProtocolError(
+            "xAI device approval did not reach the authorized state",
+            stage="approve",
+            retryable=status >= 500,
+        )
+
+    @staticmethod
+    def _approve_device_from_consent_form(client: GrokProtocolClient, consent_url: str, user_code: str) -> None:
+        consent = client._request(
+            "GET",
+            consent_url,
+            headers={"Accept": "text/html,application/xhtml+xml"},
+            allow_redirects=True,
+        )
+        if consent.status_code != 200:
+            raise XaiDeviceOAuthProtocolError("Unable to load xAI device consent", stage="consent", retryable=True)
+        final_url = _validated_url(str(consent.url), hosts=_ACCOUNT_NAVIGATION_HOSTS, stage="consent")
+        approve_url, approve_form = parse_device_consent_form(
+            str(consent.text or ""),
+            base_url=final_url,
+            user_code=user_code,
+        )
+        approve = client._request(
+            "POST",
+            approve_url,
+            data=approve_form,
+            headers={
+                "Accept": "text/html,application/xhtml+xml",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://accounts.x.ai",
+                "Referer": final_url,
+            },
+            allow_redirects=False,
+        )
+        error = _oauth_response_error(approve)
+        if error:
+            raise XaiDeviceOAuthProtocolError(f"xAI device approval failed: {error}", stage="approve")
+        if approve.status_code < 200 or approve.status_code >= 400:
+            raise XaiDeviceOAuthProtocolError("xAI rejected the device approval", stage="approve")
+        if not _approval_completed(client, approve, referer=final_url):
+            raise XaiDeviceOAuthProtocolError(
+                "xAI device approval did not reach the authorized state",
+                stage="approve",
+                retryable=True,
+            )
+
+    def authorize_browser_session(
+        self,
+        *,
+        email: str,
+        sso: str,
+        browser_bridge: Any,
+    ) -> dict[str, Any]:
+        """Approve Device OAuth inside the still-live registration browser."""
+        if browser_bridge is None or not _clean_text(getattr(browser_bridge, "session_id", "")):
+            raise XaiDeviceOAuthProtocolError("xAI registration browser session is unavailable", stage="browser_session")
+
+        protocol_config = dict(self.config)
+        protocol_config["browser_flow_enabled"] = False
+        client = GrokProtocolClient(protocol_config, proxy=self.proxy)
+        try:
+            self._emit("device_code", "创建 xAI Device Code")
+            start = client._request(
+                "POST",
+                XAI_DEVICE_CODE_URL,
+                data={"client_id": XAI_OAUTH_CLIENT_ID, "scope": XAI_OAUTH_SCOPE},
+                headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+            )
+            if start.status_code != 200:
+                raise XaiDeviceOAuthProtocolError(
+                    "Unable to start xAI device authorization",
+                    stage="device_code",
+                    retryable=True,
+                )
+            device = _safe_json(start)
+            device_code = _clean_text(device.get("device_code"))
+            user_code = _clean_text(device.get("user_code"))
+            if not device_code or not user_code:
+                raise XaiDeviceOAuthProtocolError("xAI Device Code response is incomplete", stage="device_code")
+            expires_in = max(
+                30,
+                min(int(device.get("expires_in") or _MAX_DEVICE_LIFETIME_SECONDS), _MAX_DEVICE_LIFETIME_SECONDS),
+            )
+            interval = max(1, min(int(device.get("interval") or 5), 30))
+            verification_url = _clean_text(
+                device.get("verification_uri_complete")
+                or device.get("verification_url_complete")
+                or device.get("verification_uri")
+                or device.get("verification_url")
+            )
+            if not verification_url:
+                verification_url = "https://accounts.x.ai/sign-in?" + urlencode(
+                    {"redirect": "device", "user_code": user_code}
+                )
+            _validated_url(verification_url, hosts=_ACCOUNT_NAVIGATION_HOSTS, stage="approve")
+
+            self._emit("approve", "在注册浏览器会话中提交 Device Code Allow")
+            try:
+                approved = browser_bridge.authorize_device(
+                    verification_url=verification_url,
+                    user_code=user_code,
+                    timeout_s=min(expires_in, max(60, int(self.config.get("captcha_timeout") or 180))),
+                )
+            except Exception as exc:
+                raise XaiDeviceOAuthProtocolError(
+                    str(exc) or "xAI browser device approval failed",
+                    stage=_clean_text(getattr(exc, "stage", "approve")) or "approve",
+                    retryable=bool(getattr(exc, "retryable", False)),
+                ) from exc
+            if not bool(approved.get("ok")):
+                raise XaiDeviceOAuthProtocolError(
+                    f"xAI browser device approval failed: {_clean_text(approved.get('reason')) or 'unknown'}",
+                    stage="approve",
+                    retryable=True,
+                )
+
+            self._emit("token", "轮询 xAI OAuth token")
+            deadline = time.monotonic() + expires_in
+            while time.monotonic() < deadline:
+                token = client._request(
+                    "POST",
+                    XAI_TOKEN_URL,
+                    data={
+                        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                        "device_code": device_code,
+                        "client_id": XAI_OAUTH_CLIENT_ID,
+                    },
+                    headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+                    allow_redirects=False,
+                )
+                token_payload = _safe_json(token)
+                if token.status_code == 200 and _clean_text(token_payload.get("access_token")):
+                    clean_sso = _normalize_sso(sso)
+                    if clean_sso:
+                        token_payload["sso"] = clean_sso
+                    self._emit("completed", "Device Code OAuth 已在注册浏览器中授权")
+                    return token_payload
+                error = _clean_text(token_payload.get("error"))
+                if error == "slow_down":
+                    interval = min(interval + 5, 30)
+                elif error not in {"authorization_pending", "slow_down"}:
+                    description = _clean_text(token_payload.get("error_description"))
+                    detail = f" ({description})" if description else ""
+                    raise XaiDeviceOAuthProtocolError(
+                        f"xAI Device Code token exchange failed: {error or 'unexpected_response'}{detail}",
+                        stage="token",
+                        retryable=error == "invalid_grant",
+                    )
+                time.sleep(interval)
+            raise XaiDeviceOAuthProtocolError("xAI Device Code authorization expired", stage="token", retryable=True)
+        finally:
+            client.close()
+
     def authorize(
         self,
         *,
@@ -457,16 +714,23 @@ class XaiDeviceOAuthProtocol:
         password: str,
         sso: str = "",
         sso_only: bool = False,
+        session_cookies: dict[str, str] | None = None,
+        session_cookie_jar: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         clean_email = _clean_text(email)
         clean_password = _clean_text(password)
-        clean_sso = _normalize_sso(sso)
+        restored = {**flatten_cookie_jar(session_cookie_jar), **dict(session_cookies or {})}
+        clean_sso = _normalize_sso(sso or restored.get("sso") or restored.get("sso-rw"))
         if (sso_only or not clean_sso) and (not clean_email or not clean_password):
             raise XaiDeviceOAuthProtocolError("Saved Grok account is missing email or password", stage="account")
 
         client = GrokProtocolClient(self.config, proxy=self.proxy)
         solver: TurnstileSolver | None = None
         try:
+            apply_cookie_jar(client.session, session_cookie_jar)
+            for name, value in dict(session_cookies or {}).items():
+                if name and value and name not in {"sso", "sso-rw"}:
+                    client.session.cookies.set(name, value, domain=".x.ai", path="/", secure=True)
             self._emit("device_code", "创建 xAI Device Code")
             start = client._request(
                 "POST",
@@ -485,50 +749,22 @@ class XaiDeviceOAuthProtocol:
             interval = max(1, min(int(device.get("interval") or 5), 30))
 
             session_sso = clean_sso
-            consent: Any | None = None
-            approve_url = ""
-            approve_form: dict[str, str] = {}
             device_done = False
 
             if clean_sso and not sso_only:
                 self._emit("sso", "使用已有 Grok SSO 建立 Device Code 授权上下文")
                 self._set_sso_cookie(client, clean_sso)
                 try:
-                    consent_url = self._verify_device_code(client, user_code, stage="sso")
-                    device_done = urlparse(consent_url).path.startswith("/oauth2/device/done")
+                    self._emit("approve", "通过 xAI Device API 提交 Allow")
+                    device_done, consent_url = self._approve_device_direct(client, user_code, stage="sso")
                     if not device_done:
-                        direct_consent = client._request(
-                            "GET",
-                            consent_url,
-                            headers={"Accept": "text/html,application/xhtml+xml"},
-                            allow_redirects=True,
-                        )
-                        if direct_consent.status_code != 200:
-                            raise XaiDeviceOAuthProtocolError(
-                                "Unable to load xAI device consent with saved SSO",
-                                stage="sso",
-                                retryable=True,
-                            )
-                        final_url = _validated_url(
-                            str(direct_consent.url),
-                            hosts=_ACCOUNT_NAVIGATION_HOSTS,
-                            stage="sso",
-                        )
-                        device_done = urlparse(final_url).path.startswith("/oauth2/device/done")
-                        if not device_done:
-                            approve_url, approve_form = parse_device_consent_form(
-                                str(direct_consent.text or ""),
-                                base_url=final_url,
-                                user_code=user_code,
-                            )
-                            consent = direct_consent
+                        self._emit("consent", "新 Device API 不兼容，回退授权表单")
+                        self._approve_device_from_consent_form(client, consent_url, user_code)
+                        device_done = True
                     self._emit("sso", "已有 Grok SSO 可用，跳过邮箱密码登录")
                 except XaiDeviceOAuthProtocolError as sso_error:
                     self._clear_sso_cookie(client)
                     session_sso = ""
-                    consent = None
-                    approve_url = ""
-                    approve_form = {}
                     device_done = False
                     if not clean_email or not clean_password:
                         raise XaiDeviceOAuthProtocolError(
@@ -537,7 +773,7 @@ class XaiDeviceOAuthProtocol:
                         ) from sso_error
                     self._emit("signin", "Grok SSO 已失效，回退邮箱密码登录")
 
-            if consent is None and not device_done:
+            if not device_done:
                 self._emit("bootstrap", "发现当前 Castle SDK 和登录参数")
                 metadata = client.bootstrap()
                 self._emit("signin", "建立 xAI 账号登录上下文")
@@ -628,60 +864,12 @@ class XaiDeviceOAuthProtocol:
                     self._emit("completed", "Grok SSO 登录态已恢复")
                     return {"sso": session_sso}
 
-                self._emit("consent", "读取 Device Code 授权主体")
-                consent_url = self._verify_device_code(client, user_code, stage="consent")
-                consent = client._request(
-                    "GET",
-                    consent_url,
-                    headers={"Accept": "text/html,application/xhtml+xml"},
-                    allow_redirects=True,
-                )
-                if consent.status_code != 200:
-                    raise XaiDeviceOAuthProtocolError("Unable to load xAI device consent", stage="consent", retryable=True)
-                approve_url, approve_form = parse_device_consent_form(
-                    str(consent.text or ""),
-                    base_url=str(consent.url),
-                    user_code=user_code,
-                )
-
-            if not device_done:
-                self._emit("approve", "提交 Device Code Allow")
-                minimal_form = {
-                    "user_code": user_code,
-                    "action": "allow",
-                    "principal_type": _clean_text(approve_form.get("principal_type")) or "User",
-                    "principal_id": _clean_text(approve_form.get("principal_id")),
-                }
-                approval_forms = [approve_form]
-                if minimal_form != approve_form:
-                    approval_forms.append(minimal_form)
-                approved = False
-                for approval_index, approval_form in enumerate(approval_forms):
-                    approve = client._request(
-                        "POST",
-                        approve_url if approval_index == 0 else _DEVICE_APPROVE_URL,
-                        data=approval_form,
-                        headers={
-                            "Accept": "text/html,application/xhtml+xml",
-                            "Content-Type": "application/x-www-form-urlencoded",
-                            "Origin": "https://accounts.x.ai",
-                            "Referer": str(consent.url),
-                        },
-                        allow_redirects=False,
-                    )
-                    if approve.status_code < 200 or approve.status_code >= 400:
-                        if approval_index + 1 < len(approval_forms):
-                            continue
-                        raise XaiDeviceOAuthProtocolError("xAI rejected the device approval", stage="approve")
-                    if _approval_completed(client, approve, referer=str(consent.url)):
-                        approved = True
-                        break
-                if not approved:
-                    raise XaiDeviceOAuthProtocolError(
-                        "xAI device approval did not reach the authorized state",
-                        stage="approve",
-                        retryable=True,
-                    )
+                self._emit("approve", "通过 xAI Device API 提交 Allow")
+                device_done, consent_url = self._approve_device_direct(client, user_code, stage="consent")
+                if not device_done:
+                    self._emit("consent", "新 Device API 不兼容，回退授权表单")
+                    self._approve_device_from_consent_form(client, consent_url, user_code)
+                    device_done = True
 
             self._emit("token", "轮询 xAI OAuth token")
             deadline = time.monotonic() + expires_in

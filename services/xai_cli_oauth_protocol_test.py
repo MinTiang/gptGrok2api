@@ -5,6 +5,7 @@ import json
 import unittest
 
 from services.xai_cli_oauth_protocol import (
+    XAI_OAUTH_SCOPE,
     anthropic_messages_to_response_input,
     chat_messages_to_response_input,
     normalize_model_ids,
@@ -22,6 +23,11 @@ def _jwt(payload: dict[str, object]) -> str:
 
 
 class XaiCliOAuthProtocolTest(unittest.TestCase):
+    def test_device_scope_includes_required_conversation_permissions(self) -> None:
+        scopes = set(XAI_OAUTH_SCOPE.split())
+        self.assertIn("conversations:read", scopes)
+        self.assertIn("conversations:write", scopes)
+
     def test_jwt_hints_are_optional_and_do_not_require_signature_verification(self) -> None:
         token = _jwt({"email": "person@example.com", "exp": 2_000_000_000})
         self.assertEqual(token_email(token), "person@example.com")

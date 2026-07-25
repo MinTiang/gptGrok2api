@@ -18,6 +18,27 @@ from services.register_service import RegisterService, _normalize
 
 
 class RegisterServiceGrokTest(unittest.TestCase):
+    def test_grok_browser_flow_defaults_on_but_can_be_disabled(self) -> None:
+        defaults = _normalize({"target": "grok"})
+        legacy_disabled = _normalize({"target": "grok", "grok": {"browser_flow_enabled": False}})
+
+        self.assertTrue(defaults["grok"]["browser_flow_enabled"])
+        self.assertTrue(legacy_disabled["grok"]["browser_flow_enabled"])
+
+    def test_persisted_running_task_is_not_resumed_on_process_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_file = Path(temp_dir) / "register.json"
+            store_file.write_text(
+                json.dumps({"target": "grok", "enabled": True, "stats": {"running": 3}}),
+                encoding="utf-8",
+            )
+
+            service = RegisterService(store_file)
+
+            self.assertFalse(service.get()["enabled"])
+            self.assertEqual(service.get()["stats"]["running"], 0)
+            self.assertIsNone(service._runner)
+
     def test_grok_account_exports_match_sub2api_and_cpa_contracts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = RegisterService(Path(temp_dir) / "register.json")
@@ -1078,6 +1099,15 @@ class RegisterServiceGrokTest(unittest.TestCase):
                             "sso": "oauth-default-sso",
                             "session": "live-cookie",
                         },
+                        "oauth_cookie_jar": [
+                            {
+                                "name": "cf_clearance",
+                                "value": "live-clearance-cookie",
+                                "domain": "accounts.x.ai",
+                                "path": "/",
+                                "secure": True,
+                            }
+                        ],
                         "oauth_credential": {
                             "access_token": "live-access-token",
                             "refresh_token": "live-refresh-token",
@@ -1093,6 +1123,7 @@ class RegisterServiceGrokTest(unittest.TestCase):
                 *,
                 prioritize: bool = False,
                 session_cookies: dict[str, str] | None = None,
+                session_cookie_jar: list[dict[str, object]] | None = None,
                 preauthorized_credential: dict[str, object] | None = None,
             ) -> dict[str, object]:
                 self.assertTrue(prioritize)
@@ -1100,6 +1131,7 @@ class RegisterServiceGrokTest(unittest.TestCase):
                     session_cookies,
                     {"sso": "oauth-default-sso", "session": "live-cookie"},
                 )
+                self.assertEqual(session_cookie_jar, backend.worker(1)["result"]["oauth_cookie_jar"])
                 self.assertEqual(
                     preauthorized_credential,
                     {
@@ -1127,6 +1159,7 @@ class RegisterServiceGrokTest(unittest.TestCase):
             self.assertEqual(protocol_calls, [accounts[0]["id"]])
             self.assertNotIn("oauth_session_cookies", accounts[0])
             self.assertNotIn("oauth_credential", accounts[0])
+            self.assertEqual(accounts[0]["oauth_cookie_jar"][0]["domain"], "accounts.x.ai")
             persisted = (Path(temp_dir) / "grok_accounts.json").read_text(encoding="utf-8")
             self.assertNotIn("live-access-token", persisted)
             self.assertNotIn("live-refresh-token", persisted)

@@ -144,6 +144,7 @@ export const providerLocalOnlyKeys: Record<string, string[]> = {
 
 export const defaultGrokRegisterConfig: GrokRegisterConfig = {
   signup_flow: 'xconsole',
+  browser_flow_enabled: true,
   provider: 'yescaptcha',
   api_key: '',
   api_base: '',
@@ -274,6 +275,7 @@ export function normalizeGrokRegisterConfig(value: unknown): GrokRegisterConfig 
     ...defaultGrokRegisterConfig,
     ...input,
     signup_flow: input.signup_flow === 'legacy' ? 'legacy' : 'xconsole',
+    browser_flow_enabled: true,
     provider: normalizeTurnstileProvider(input.provider),
     api_key: String(input.api_key || '').trim(),
     api_base: String(input.api_base || '').trim(),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import random
+import re
 import secrets
 import string
 import threading
@@ -40,6 +41,7 @@ config: dict[str, Any] = {
         "request_timeout": 30,
         "captcha_timeout": 180,
         "captcha_poll_interval": 3,
+        "oauth_fresh_account_retry_delay": 15,
         "local_concurrency": 2,
         "local_attempt_timeout": 45,
         "local_queue_timeout": 60,
@@ -129,7 +131,34 @@ def _mail_config(register_proxy: str) -> dict[str, Any]:
 
 def _resolve_register_proxy(raw_proxy: str) -> tuple[str, str]:
     profile = proxy_settings.get_profile(proxy=str(raw_proxy or "").strip(), upstream=True)
-    return profile.proxy_url or "direct", profile.proxy_source
+    proxy_url = profile.proxy_url or "direct"
+    task_proxy = _task_scoped_proxy(proxy_url)
+    source = profile.proxy_source
+    if task_proxy != proxy_url:
+        source = f"{source}_task_sid"
+    return task_proxy, source
+
+
+def _task_scoped_proxy(proxy_url: str, *, session_id: str = "") -> str:
+    candidate = str(proxy_url or "").strip()
+    scheme, separator, authority = candidate.partition("://")
+    if not separator or "@" not in authority:
+        return candidate
+    userinfo, at, destination = authority.rpartition("@")
+    username, password_separator, password = userinfo.partition(":")
+    sid = str(session_id or "").strip() or secrets.token_hex(4)
+    rotated_username, replacements = re.subn(
+        r"(?i)(-sid-)[^-:]+(?=-t-\d+(?:-|$))",
+        rf"\g<1>{sid}",
+        username,
+        count=1,
+    )
+    if replacements != 1:
+        return candidate
+    rotated_userinfo = rotated_username
+    if password_separator:
+        rotated_userinfo = f"{rotated_username}:{password}"
+    return f"{scheme}://{rotated_userinfo}{at}{destination}"
 
 
 def _random_password(length: int = 18) -> str:
@@ -176,15 +205,48 @@ def _mail_retryable(error: Exception) -> bool:
     )
 
 
-def _authorize_live_pkce(
+def _authorize_live_oauth(
     index: int,
     client: GrokProtocolClient,
     account: dict[str, Any],
 ) -> dict[str, Any]:
     grok_config = client.config
+    email = str(account.get("email") or "").strip()
     if not _truthy(grok_config.get("xai_cli_oauth_enabled"), True):
         return {}
-    if str(grok_config.get("xai_cli_oauth_flow") or "device").strip().lower() != "pkce_reference":
+    flow = str(grok_config.get("xai_cli_oauth_flow") or "device").strip().lower()
+    browser_session_id = getattr(client, "browser_session_id", "")
+    if flow == "device" and isinstance(browser_session_id, str) and browser_session_id.strip():
+        from services.xai_device_oauth_protocol import XaiDeviceOAuthProtocol, XaiDeviceOAuthProtocolError
+
+        bridge = getattr(client, "browser_bridge", None)
+        step(index, f"账号创建成功，正在完成 OAuth 授权：{email}")
+        protocol = XaiDeviceOAuthProtocol(
+            grok_config,
+            proxy=client.proxy,
+            progress=lambda _stage, message: debug_step(index, f"{message}：{email}"),
+        )
+        authorize_kwargs = {
+            "email": email,
+            "sso": str(account.get("sso") or "").strip(),
+            "browser_bridge": bridge,
+        }
+        try:
+            credential = protocol.authorize_browser_session(**authorize_kwargs)
+        except XaiDeviceOAuthProtocolError as error:
+            if not bool(getattr(error, "retryable", False)) or str(getattr(error, "stage", "")) != "token":
+                raise
+            retry_delay = max(
+                5,
+                min(60, int(grok_config.get("oauth_fresh_account_retry_delay") or 15)),
+            )
+            step(index, f"新账号 OAuth 权限可能尚未生效，{retry_delay} 秒后换新 Device Code 重试：{email}", "yellow")
+            time.sleep(retry_delay)
+            credential = protocol.authorize_browser_session(**authorize_kwargs)
+        step(index, f"OAuth 授权完成，正在验证额度：{email}", "green")
+        return credential
+
+    if flow != "pkce_reference":
         return {}
 
     from services.xai_reference_pkce_protocol import XaiReferencePkceProtocol
@@ -195,12 +257,12 @@ def _authorize_live_pkce(
         reference_dir,
         proxy=client.proxy,
         timeout=timeout,
-        progress=lambda _stage, message: debug_step(index, message),
+        progress=lambda _stage, message: debug_step(index, f"{message}：{email}"),
         turnstile_config=grok_config,
     )
-    step(index, "账号创建成功，正在完成 OAuth 授权")
+    step(index, f"账号创建成功，正在完成 OAuth 授权：{email}")
     credential = protocol.authorize_live_session(
-        email=str(account.get("email") or "").strip(),
+        email=email,
         password=str(account.get("password") or "").strip(),
         sso=str(account.get("sso") or "").strip(),
         session=client.session,
@@ -209,8 +271,13 @@ def _authorize_live_pkce(
             if isinstance(account.get("oauth_session_cookies"), dict)
             else {}
         ),
+        session_cookie_jar=(
+            list(account.get("oauth_cookie_jar"))
+            if isinstance(account.get("oauth_cookie_jar"), list)
+            else []
+        ),
     )
-    step(index, "OAuth 授权完成，正在验证额度", "green")
+    step(index, f"OAuth 授权完成，正在验证额度：{email}", "green")
     return credential
 
 
@@ -228,20 +295,21 @@ def _register_once(
     if not email:
         mail_provider.release_mailbox(mailbox)
         raise GrokProtocolError("邮箱服务未返回 address", stage="mail", mail_retryable=True)
+    step(index, f"注册邮箱已获取：{email}")
     mailbox_finalized = False
     draft: dict[str, Any] | None = None
     try:
         mailbox["_received_after"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
         client.bootstrap()
         client.send_email_validation_code(email)
-        step(index, "验证码已发送，等待邮件")
+        step(index, f"验证码已发送，等待邮件：{email}")
         code = mail_provider.wait_for_code(mail_config, mailbox)
         if not code:
             raise GrokProtocolError("等待 Grok 验证码超时", stage="mail", mail_retryable=True)
         code_text = str(code)
         normalized_code = code_text.strip()
         client.verify_email_validation_code(email, normalized_code)
-        step(index, "邮箱验证完成，正在进行安全校验")
+        step(index, f"邮箱验证完成，正在进行安全校验：{email}")
 
         given_name, family_name = _random_name()
         password = _random_password()
@@ -261,7 +329,7 @@ def _register_once(
             "status": "submitting",
         }
         _persist_account_snapshot(draft)
-        step(index, "安全校验完成，正在创建账号")
+        step(index, f"安全校验完成，正在创建账号：{email}")
         try:
             account = client.create_user_and_session(
                 email=email,
@@ -300,11 +368,18 @@ def _register_once(
         mailbox_finalized = True
         session_cookie_reader = getattr(client, "session_cookies", None)
         session_cookies = session_cookie_reader() if callable(session_cookie_reader) else {}
+        if not isinstance(session_cookies, dict):
+            session_cookies = {}
+        session_cookie_jar_reader = getattr(client, "session_cookie_jar", None)
+        session_cookie_jar = session_cookie_jar_reader() if callable(session_cookie_jar_reader) else []
+        if not isinstance(session_cookie_jar, list):
+            session_cookie_jar = []
         result = {
             "email": email,
             "password": password,
             "sso": sso,
             "oauth_session_cookies": session_cookies,
+            "oauth_cookie_jar": session_cookie_jar,
             "profile": {
                 "given_name": given_name,
                 "family_name": family_name,
@@ -315,7 +390,7 @@ def _register_once(
             "status": "active",
         }
         try:
-            oauth_credential = _authorize_live_pkce(index, client, result)
+            oauth_credential = _authorize_live_oauth(index, client, result)
         except Exception as error:
             result["oauth_live_error"] = _short_error(error, limit=500)
             oauth_error = GrokProtocolError(
@@ -329,6 +404,10 @@ def _register_once(
             result["oauth_credential"] = oauth_credential
         return result
     except Exception as error:
+        try:
+            error.registration_email = email
+        except Exception:
+            pass
         if not mailbox_finalized:
             mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
         raise
@@ -345,22 +424,28 @@ def worker(index: int) -> dict[str, Any]:
         grok_config = copy.deepcopy(config.get("grok") if isinstance(config.get("grok"), dict) else {})
         mail_config = _mail_config(proxy)
         max_attempts = _max_mail_retries(grok_config)
-        client = GrokProtocolClient(grok_config, proxy=proxy, log=lambda message: debug_step(index, message))
         for attempt in range(1, max_attempts + 1):
+            client = GrokProtocolClient(grok_config, proxy=proxy, log=lambda message: debug_step(index, message))
             try:
                 result = _register_once(index, client, mail_config, attempt, max_attempts)
                 elapsed = time.monotonic() - started
-                step(index, f"注册成功（{elapsed:.1f} 秒）", "green")
+                step(index, f"注册成功（{elapsed:.1f} 秒）：{str(result.get('email') or '').strip()}", "green")
                 return {"ok": True, "index": index, "result": result}
             except Exception as error:
                 last_error = error
                 if attempt >= max_attempts or not _mail_retryable(error):
                     raise
-                step(index, f"邮箱不可用，正在更换（下一次 {attempt + 1}/{max_attempts}）", "yellow")
+                client.close()
+                client = None
+                failed_email = str(getattr(error, "registration_email", "") or "").strip()
+                email_text = f"：{failed_email}" if failed_email else ""
+                step(index, f"邮箱不可用{email_text}，正在更换（下一次 {attempt + 1}/{max_attempts}）", "yellow")
         raise last_error or RuntimeError("Grok 注册失败")
     except Exception as error:
         elapsed = time.monotonic() - started
-        step(index, f"注册失败（{elapsed:.1f} 秒）：{_short_error(error)}", "red")
+        failed_email = str(getattr(error, "registration_email", "") or "").strip()
+        email_text = f"：{failed_email}，原因：" if failed_email else "："
+        step(index, f"注册失败（{elapsed:.1f} 秒）{email_text}{_short_error(error)}", "red")
         result = {"ok": False, "index": index, "error": str(error)}
         partial = getattr(error, "partial_result", None)
         if isinstance(partial, dict) and partial:

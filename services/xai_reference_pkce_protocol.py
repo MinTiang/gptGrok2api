@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from services.xai_reference_pkce_worker import RESULT_PREFIX
+from services.xai_session_cookies import apply_cookie_jar, flatten_cookie_jar, normalize_cookie_jar
 
 
 _REFERENCE_IMPORT_LOCK = threading.Lock()
@@ -77,6 +78,7 @@ class XaiReferencePkceProtocol:
         sso: str = "",
         session: Any,
         session_cookies: dict[str, str] | None = None,
+        session_cookie_jar: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Run the reference PKCE flow on the registration curl_cffi session."""
         self._validate_reference()
@@ -138,7 +140,9 @@ class XaiReferencePkceProtocol:
                 unused_session.close()
             except Exception:
                 pass
-            cookies = dict(session_cookies or {})
+            scoped_cookies = normalize_cookie_jar(session_cookie_jar)
+            apply_cookie_jar(session, scoped_cookies)
+            cookies = {**flatten_cookie_jar(scoped_cookies), **dict(session_cookies or {})}
             if sso:
                 cookies.setdefault("sso", sso)
                 cookies.setdefault("sso-rw", sso)
@@ -182,6 +186,7 @@ class XaiReferencePkceProtocol:
         password: str,
         sso: str = "",
         session_cookies: dict[str, str] | None = None,
+        session_cookie_jar: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         python = self.reference_dir / ".venv" / "bin" / "python"
         self._validate_reference()
@@ -198,6 +203,7 @@ class XaiReferencePkceProtocol:
                 "password": str(password or "").strip(),
                 "sso": str(sso or "").strip(),
                 "session_cookies": dict(session_cookies or {}),
+                "session_cookie_jar": normalize_cookie_jar(session_cookie_jar),
                 "proxy": self.proxy,
             },
             ensure_ascii=True,

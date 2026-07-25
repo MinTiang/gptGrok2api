@@ -72,12 +72,12 @@
       <template v-if="item.oauth">
         <div class="grid gap-1 font-mono text-xs tabular-nums">
           <p class="grid grid-cols-[3.5rem_1fr] gap-2">
-            <span class="text-muted-foreground">请求</span>
-            <span class="text-foreground">{{ grokOAuthRequestQuotaText(item) }}</span>
+            <span class="text-muted-foreground">剩余</span>
+            <span class="text-foreground">{{ grokOAuthRemainingQuotaText(item) }}</span>
           </p>
           <p class="grid grid-cols-[3.5rem_1fr] gap-2">
-            <span class="text-muted-foreground">Token</span>
-            <span class="text-foreground">{{ grokOAuthTokenQuotaText(item) }}</span>
+            <span class="text-muted-foreground">重置</span>
+            <span class="whitespace-nowrap text-foreground">{{ grokOAuthQuotaResetText(item) }}</span>
           </p>
         </div>
       </template>
@@ -164,13 +164,13 @@ import {
   grokRefreshFailed,
   grokRefreshStatusTitle,
   grokOAuthStatusClass,
-  grokOAuthRequestQuotaText,
+  grokOAuthRemainingQuotaText,
   grokOAuthRecoveryStatusClass,
   grokOAuthRecoveryStatusText,
   grokOAuthRecoveryStatusTitle,
   grokOAuthShortStatusText,
   grokOAuthStatusTitle,
-  grokOAuthTokenQuotaText,
+  grokOAuthQuotaResetText,
   grokProbeStatusClass,
   grokProbeStatusText,
   grokProbeStatusTitle,
