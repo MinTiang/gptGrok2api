@@ -12,6 +12,7 @@ from typing import Any, Callable, Literal
 
 from app.platform.config.snapshot import get_config
 from app.platform.logging.logger import logger
+from utils.sqlite_runtime import sqlite_connection_guard
 
 from .media_paths import (
     image_files_dir,
@@ -55,7 +56,7 @@ class LocalMediaCacheStore:
         max_bytes = self._limit_bytes(media_type)
         if max_bytes <= 0:
             return
-        with self._guard(media_type), closing(self._connect()) as conn:
+        with self._guard(media_type), sqlite_connection_guard, closing(self._connect()) as conn:
             rows = []
             for path in self._iter_files(media_type):
                 try:
@@ -127,7 +128,7 @@ class LocalMediaCacheStore:
             self._write_if_missing(path, raw)
             return path
 
-        with self._guard(media_type), closing(self._connect()) as conn:
+        with self._guard(media_type), sqlite_connection_guard, closing(self._connect()) as conn:
             if path.exists():
                 self._upsert_existing_row(conn, media_type, path)
             else:
@@ -440,7 +441,7 @@ class LocalMediaCacheStore:
         db_path = local_media_cache_db_path()
         if not db_path.exists():
             return
-        with closing(self._connect()) as conn:
+        with sqlite_connection_guard, closing(self._connect()) as conn:
             conn.execute(
                 f"DELETE FROM {_TABLE} WHERE media_type = ? AND name = ?",
                 (media_type, name),
@@ -451,7 +452,7 @@ class LocalMediaCacheStore:
         db_path = local_media_cache_db_path()
         if not db_path.exists():
             return
-        with closing(self._connect()) as conn:
+        with sqlite_connection_guard, closing(self._connect()) as conn:
             conn.execute(f"DELETE FROM {_TABLE} WHERE media_type = ?", (media_type,))
             conn.commit()
 

@@ -3,12 +3,12 @@
 import asyncio
 import json
 import sqlite3
-import threading
 from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 
 from app.platform.runtime.clock import now_ms
+from utils.sqlite_runtime import sqlite_connection_guard
 from ..commands import AccountPatch, AccountUpsert, BulkReplacePoolCommand, ListAccountsQuery
 from ..enums import AccountStatus
 from ..models import (
@@ -38,10 +38,7 @@ class LocalAccountRepository:
     def __init__(self, db_path: Path) -> None:
         self._path = Path(db_path)
         self._lock = asyncio.Lock()
-        # Python's bundled SQLite can deadlock inside WAL open/close when many
-        # worker threads churn short-lived connections concurrently.  Keep the
-        # complete connection lifecycle serial for this repository instance.
-        self._connect_lock = threading.RLock()
+        self._connect_lock = sqlite_connection_guard
 
     # ------------------------------------------------------------------
     # Internal helpers

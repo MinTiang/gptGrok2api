@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile
     image: chatgpt2api-captcha-solver:local
     container_name: chatgpt2api-captcha-solver
+    init: true
     restart: unless-stopped
     ports:
       - "127.0.0.1:${CAPTCHA_SOLVER_PORT:-8877}:8877"

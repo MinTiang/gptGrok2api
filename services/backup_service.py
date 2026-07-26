@@ -21,6 +21,7 @@ from curl_cffi import requests
 from services.config import BASE_DIR, CONFIG_FILE, DATA_DIR, config, load_backup_state, save_backup_state
 from services.image_storage_service import IMAGE_INDEX_FILE
 from services.image_tags_service import TAGS_FILE
+from utils.sqlite_runtime import sqlite_connection_guard
 
 
 def _utc_now() -> datetime:
@@ -145,7 +146,7 @@ def _sqlite_backup_bytes(source: Path) -> bytes | None:
         with tempfile.NamedTemporaryFile(prefix="chatgpt2api-grok-", suffix=".db", delete=False) as handle:
             temp_path = Path(handle.name)
         source_uri = f"file:{quote(source.resolve().as_posix(), safe='/')}?mode=ro"
-        with closing(sqlite3.connect(source_uri, uri=True)) as source_db, closing(
+        with sqlite_connection_guard, closing(sqlite3.connect(source_uri, uri=True)) as source_db, closing(
             sqlite3.connect(temp_path)
         ) as backup_db:
             source_db.backup(backup_db)

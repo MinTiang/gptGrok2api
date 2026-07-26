@@ -12,6 +12,7 @@ from typing import Any
 from cryptography.fernet import Fernet, InvalidToken
 
 from services.config import DATA_DIR
+from utils.sqlite_runtime import sqlite_connection_guard
 
 
 class AgentIdentityStore:
@@ -82,7 +83,7 @@ class AgentIdentityStore:
         return connection
 
     def _initialize(self) -> None:
-        with self._lock, closing(self._connect()) as connection:
+        with self._lock, sqlite_connection_guard, closing(self._connect()) as connection:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS agent_identities (
@@ -123,7 +124,7 @@ class AgentIdentityStore:
         if not account_id or not runtime_id or not private_key:
             raise ValueError("Agent Identity is incomplete")
         now = datetime.now(timezone.utc).isoformat()
-        with self._lock, closing(self._connect()) as connection:
+        with self._lock, sqlite_connection_guard, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
@@ -172,7 +173,7 @@ class AgentIdentityStore:
         key = str(account_id or "").strip()
         if not key:
             return None
-        with self._lock, closing(self._connect()) as connection:
+        with self._lock, sqlite_connection_guard, closing(self._connect()) as connection:
             row = connection.execute(
                 "SELECT * FROM agent_identities WHERE account_id = ?", (key,)
             ).fetchone()
@@ -180,7 +181,7 @@ class AgentIdentityStore:
 
     def list_auth(self, account_ids: list[str] | None = None) -> list[dict[str, Any]]:
         targets = {str(item or "").strip() for item in (account_ids or []) if str(item or "").strip()}
-        with self._lock, closing(self._connect()) as connection:
+        with self._lock, sqlite_connection_guard, closing(self._connect()) as connection:
             rows = connection.execute(
                 "SELECT * FROM agent_identities ORDER BY updated_at DESC"
             ).fetchall()
@@ -191,7 +192,7 @@ class AgentIdentityStore:
         ]
 
     def summary(self) -> list[dict[str, str]]:
-        with self._lock, closing(self._connect()) as connection:
+        with self._lock, sqlite_connection_guard, closing(self._connect()) as connection:
             rows = connection.execute(
                 """
                 SELECT account_id, user_id, email, plan_type, agent_runtime_id,

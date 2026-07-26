@@ -24,6 +24,7 @@ from curl_cffi import requests
 from services.config import DATA_DIR
 from services.json_file import read_json_file, write_json_file
 from services.proxy_service import proxy_settings
+from utils.sqlite_runtime import sqlite_connection_guard
 
 DDG_ALIASES_FILE = DATA_DIR / "ddg_aliases.json"
 _ddg_aliases_lock = Lock()
@@ -185,7 +186,7 @@ def _load_outlook_token_state() -> dict[str, dict[str, Any]]:
 
     The legacy JSON file is imported once into SQLite on first access.
     """
-    with closing(_outlook_state_connection()) as connection:
+    with sqlite_connection_guard, closing(_outlook_state_connection()) as connection:
         _ensure_outlook_state_migrated(connection)
         rows = connection.execute(
             "SELECT email, state, reason, updated_at, lease_token FROM mailbox_states"
@@ -202,7 +203,7 @@ def _load_outlook_token_state() -> dict[str, dict[str, Any]]:
 
 
 def _save_outlook_token_state(state: dict[str, dict[str, Any]]) -> None:
-    with closing(_outlook_state_connection()) as connection:
+    with sqlite_connection_guard, closing(_outlook_state_connection()) as connection:
         _ensure_outlook_state_migrated(connection)
         connection.execute("BEGIN IMMEDIATE")
         connection.execute("DELETE FROM mailbox_states")
@@ -230,7 +231,7 @@ def _claim_outlook_credential(pool: list[dict[str, str]]) -> tuple[dict[str, str
     """Atomically reserve one available credential across worker processes."""
     now = datetime.now(timezone.utc)
     lease_token = secrets.token_urlsafe(24)
-    with closing(_outlook_state_connection()) as connection:
+    with sqlite_connection_guard, closing(_outlook_state_connection()) as connection:
         _ensure_outlook_state_migrated(connection)
         connection.execute("BEGIN IMMEDIATE")
         rows = connection.execute(
@@ -320,7 +321,7 @@ def _set_outlook_token_state(
     target = str(address or "").strip().lower()
     if not target:
         return False
-    with closing(_outlook_state_connection()) as connection:
+    with sqlite_connection_guard, closing(_outlook_state_connection()) as connection:
         _ensure_outlook_state_migrated(connection)
         connection.execute("BEGIN IMMEDIATE")
         if lease_token:
@@ -363,7 +364,7 @@ def _release_outlook_token_state(address: str, *, lease_token: str = "") -> bool
     target = str(address or "").strip().lower()
     if not target:
         return False
-    with closing(_outlook_state_connection()) as connection:
+    with sqlite_connection_guard, closing(_outlook_state_connection()) as connection:
         _ensure_outlook_state_migrated(connection)
         connection.execute("BEGIN IMMEDIATE")
         if lease_token:
@@ -390,7 +391,7 @@ def clear_outlook_token_states(addresses: list[str] | set[str], states: set[str]
     targets.discard("")
     if not targets:
         return 0
-    with closing(_outlook_state_connection()) as connection:
+    with sqlite_connection_guard, closing(_outlook_state_connection()) as connection:
         _ensure_outlook_state_migrated(connection)
         connection.execute("BEGIN IMMEDIATE")
         placeholders = ",".join("?" for _ in targets)
@@ -422,7 +423,7 @@ def reset_outlook_token_pool_state(scope: str = "all") -> int:
         target_states = OUTLOOK_BUSY_STATES
     else:
         target_states = set()
-    with closing(_outlook_state_connection()) as connection:
+    with sqlite_connection_guard, closing(_outlook_state_connection()) as connection:
         _ensure_outlook_state_migrated(connection)
         connection.execute("BEGIN IMMEDIATE")
         if target_states:

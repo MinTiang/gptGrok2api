@@ -17,6 +17,7 @@ from services.account_service import account_service
 from services.config import DATA_DIR
 from services.json_file import read_json_object, write_json_file
 from utils.log import logger
+from utils.sqlite_runtime import sqlite_connection_guard
 
 
 DEFAULT_CONFIG = {
@@ -106,7 +107,7 @@ class OpenAISurvivalService:
 
     def _initialize_lease_db(self) -> None:
         self._data_dir.mkdir(parents=True, exist_ok=True)
-        with closing(sqlite3.connect(self._lease_path, timeout=15)) as connection:
+        with sqlite_connection_guard, closing(sqlite3.connect(self._lease_path, timeout=15)) as connection:
             connection.execute("PRAGMA busy_timeout=15000")
             connection.execute(
                 """
@@ -124,7 +125,7 @@ class OpenAISurvivalService:
 
     def _claim_run(self, ttl_seconds: int = 3600) -> bool:
         now = time.time()
-        with closing(sqlite3.connect(self._lease_path, timeout=15)) as connection:
+        with sqlite_connection_guard, closing(sqlite3.connect(self._lease_path, timeout=15)) as connection:
             connection.execute("PRAGMA busy_timeout=15000")
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
@@ -143,7 +144,7 @@ class OpenAISurvivalService:
         return True
 
     def _release_run(self) -> None:
-        with closing(sqlite3.connect(self._lease_path, timeout=15)) as connection:
+        with sqlite_connection_guard, closing(sqlite3.connect(self._lease_path, timeout=15)) as connection:
             connection.execute(
                 "DELETE FROM scheduler_lease WHERE name = 'openai_survival' AND owner = ?",
                 (self._owner,),
@@ -151,7 +152,7 @@ class OpenAISurvivalService:
             connection.commit()
 
     def _renew_run(self, ttl_seconds: int = 3600) -> bool:
-        with closing(sqlite3.connect(self._lease_path, timeout=15)) as connection:
+        with sqlite_connection_guard, closing(sqlite3.connect(self._lease_path, timeout=15)) as connection:
             cursor = connection.execute(
                 """
                 UPDATE scheduler_lease SET expires_at = ?
