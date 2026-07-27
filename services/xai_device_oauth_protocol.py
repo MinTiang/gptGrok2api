@@ -539,17 +539,14 @@ class XaiDeviceOAuthProtocol:
         status = int(getattr(approve, "status_code", 0) or 0)
         approve_location = _clean_text(getattr(approve, "headers", {}).get("location"))
         if approve_location:
-            next_url = _validated_url(
-                urljoin(str(getattr(approve, "url", "") or _DEVICE_APPROVE_URL), approve_location),
-                hosts=_ACCOUNT_NAVIGATION_HOSTS,
-                stage="approve",
-            )
-            if _is_sign_in_url(next_url):
-                raise XaiDeviceOAuthProtocolError("xAI device approval returned to sign-in", stage="approve")
             if status in {301, 302, 303, 307, 308}:
-                return True, consent_url
-        if _is_device_authorized_body(getattr(approve, "text", "")) or 200 <= status < 300:
+                if _approval_completed(client, approve, referer=consent_url):
+                    return True, consent_url
+                return False, consent_url
+        if _is_device_authorized_body(getattr(approve, "text", "")):
             return True, consent_url
+        if 200 <= status < 300:
+            return False, consent_url
         if status in {400, 404, 405, 422}:
             return False, consent_url
         if status in {401, 403}:

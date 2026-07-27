@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
+from app.platform.errors import UpstreamError, ValidationError
 from services.xai_cli_oauth_service import XaiCliOAuthService, _billing_quota
 from services.xai_cli_oauth_store import XaiCliOAuthAccountStore
 
@@ -705,6 +706,20 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
         raw = self.store.get(str(account["id"]))
         self.assertEqual(raw["refresh_token"], "rotated-refresh")
         self.assertEqual(raw["access_token"], access)
+
+    async def test_refresh_only_invalidates_explicit_oauth_credential_errors(self) -> None:
+        transient = self._account(expires_at="2000-01-01T00:00:00+00:00")
+        transient_response = httpx.Response(403, json={"error": "temporarily_unavailable"})
+        with patch.object(self.service, "_form_post", new=AsyncMock(return_value=transient_response)):
+            with self.assertRaises(UpstreamError):
+                await self.service.refresh_account(str(transient["id"]))
+        self.assertEqual(self.store.get(str(transient["id"]))["status"], "active")
+
+        terminal_response = httpx.Response(400, json={"error": "invalid_grant"})
+        with patch.object(self.service, "_form_post", new=AsyncMock(return_value=terminal_response)):
+            with self.assertRaises(ValidationError):
+                await self.service.refresh_account(str(transient["id"]))
+        self.assertEqual(self.store.get(str(transient["id"]))["status"], "invalid")
 
     async def test_nonstream_request_records_success_and_never_uses_cookie_headers(self) -> None:
         account = self._account()

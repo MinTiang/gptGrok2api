@@ -1203,7 +1203,7 @@ class XaiCliOAuthService:
         payload = self._json_body(response)
         if response.status_code != 200 or not _clean_text(payload.get("access_token")):
             error = _clean_text(payload.get("error"))
-            if error in {"invalid_grant", "invalid_token", "unauthorized_client"} or response.status_code in {400, 401, 403}:
+            if error in {"invalid_grant", "invalid_token", "unauthorized_client"}:
                 self.store.set_status([account_id], "invalid")
                 raise ValidationError("xAI CLI OAuth account needs reauthorization", code="invalid_credentials")
             raise UpstreamError("xAI CLI OAuth token refresh failed", status=502, body=_safe_error_body(response))

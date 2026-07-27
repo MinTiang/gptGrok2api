@@ -91,6 +91,7 @@ _GROK_RECOVERY_MAX_DELAY_MINUTES = 24 * 60
 _GROK_OAUTH_RECOVERY_STALE_MINUTES = 24 * 60
 _GROK_PERMISSION_RETRY_DELAYS_SECONDS = (60, 120, 300)
 _GROK_PERMISSION_RETRY_BATCH_SIZE = 3
+_XAI_CLI_REAUTHORIZATION_ERROR = "xAI CLI OAuth account needs reauthorization"
 _GROK_PENDING_STATUSES = {
     "submitting",
     "pending_submit",
@@ -311,6 +312,22 @@ def _grok_oauth_probe_recoverable(value: object) -> bool:
     code = _clean_text(probe.get("code")).lower()
     return code != "permission-denied" and not (
         code == "personal-team-blocked" or code.startswith("personal-team-blocked:")
+    )
+
+
+def _grok_oauth_permission_pending(value: object) -> bool:
+    probe = value if isinstance(value, dict) else {}
+    code = _clean_text(probe.get("code")).lower()
+    return code == "permission-denied" or (
+        code == "personal-team-blocked" or code.startswith("personal-team-blocked:")
+    )
+
+
+def _grok_oauth_reauthorization_required(value: object) -> bool:
+    item = value if isinstance(value, dict) else {}
+    return (
+        _clean_text(item.get("last_error")) == _XAI_CLI_REAUTHORIZATION_ERROR
+        or _grok_oauth_probe_recoverable(item.get("probe"))
     )
 
 
@@ -2283,8 +2300,7 @@ class RegisterService:
         oauth_account_id = _clean_text(oauth_item.get("id"))
         if not oauth_account_id or _clean_text(oauth_item.get("status")).lower() == "disabled":
             return {"status": "deferred"}
-        probe = oauth_item.get("probe") if isinstance(oauth_item.get("probe"), dict) else {}
-        if not _grok_oauth_probe_recoverable(probe):
+        if not _grok_oauth_reauthorization_required(oauth_item):
             return {"status": "deferred"}
 
         now = datetime.now(timezone.utc)
@@ -2387,7 +2403,7 @@ class RegisterService:
             return False
         return any(
             _clean_text(item.get("status")).lower() != "disabled"
-            and _grok_oauth_probe_recoverable(item.get("probe"))
+            and _grok_oauth_reauthorization_required(item)
             and _clean_text(
                 item.get("recovery", {}).get("status") if isinstance(item.get("recovery"), dict) else ""
             ).lower()
@@ -2405,7 +2421,7 @@ class RegisterService:
         now = datetime.now(timezone.utc)
         return any(
             _clean_text(item.get("status")).lower() != "disabled"
-            and _grok_oauth_probe_recoverable(item.get("probe"))
+            and _grok_oauth_reauthorization_required(item)
             and RegisterService._grok_oauth_recovery_due(item, now=now)
             for item in items
             if isinstance(item, dict)
@@ -2660,7 +2676,7 @@ class RegisterService:
             if not isinstance(item, dict) or _clean_text(item.get("status")).lower() == "disabled":
                 continue
             probe = item.get("probe") if isinstance(item.get("probe"), dict) else {}
-            if _clean_text(probe.get("code")).lower() != "permission-denied":
+            if not _grok_oauth_permission_pending(probe):
                 continue
             probed_at = _parse_datetime(probe.get("at"))
             retry_delay = _grok_permission_retry_delay_seconds(item)
@@ -2696,7 +2712,7 @@ class RegisterService:
                 1 for item in results if _clean_text(item.get("status")).lower() == "valid"
             )
             summary["pending"] = sum(
-                1 for item in results if _clean_text(item.get("code")).lower() == "permission-denied"
+                1 for item in results if _grok_oauth_permission_pending(item)
             )
             summary["failed"] = max(0, summary["tested"] - summary["valid"] - summary["pending"])
             selected_by_id = {_clean_text(item.get("id")): item for item in selected}
@@ -2709,7 +2725,7 @@ class RegisterService:
                 metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
                 retry = metadata.get("permission_retry") if isinstance(metadata.get("permission_retry"), dict) else {}
                 status = _clean_text(result.get("status")).lower()
-                pending = _clean_text(result.get("code")).lower() == "permission-denied"
+                pending = _grok_oauth_permission_pending(result)
                 attempts = max(0, _safe_int(retry.get("attempts"))) + (1 if pending else 0)
                 next_delay = (
                     _GROK_PERMISSION_RETRY_DELAYS_SECONDS[
@@ -2779,7 +2795,7 @@ class RegisterService:
                 item
                 for item in oauth_items
                 if _clean_text(item.get("status")).lower() != "disabled"
-                and _grok_oauth_probe_recoverable(item.get("probe"))
+                and _grok_oauth_reauthorization_required(item)
             ]
             candidates.sort(
                 key=lambda item: 0

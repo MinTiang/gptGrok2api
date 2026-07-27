@@ -457,7 +457,11 @@ class XaiCliOAuthAccountStore:
         merged["use_count"] = _non_negative_int(existing.get("use_count"))
         merged["fail_count"] = _non_negative_int(existing.get("fail_count"))
         merged["last_used_at"] = _clean_text(existing.get("last_used_at"))
-        merged["last_error"] = _safe_error(existing.get("last_error"), existing)
+        credentials_rotated = (
+            bool(_clean_text(incoming.get("access_token")))
+            and _clean_text(incoming.get("access_token")) != _clean_text(existing.get("access_token"))
+        )
+        merged["last_error"] = "" if credentials_rotated else _safe_error(existing.get("last_error"), existing)
         merged["updated_at"] = _now()
         return merged
 
@@ -677,6 +681,9 @@ class XaiCliOAuthAccountStore:
                     item["email"] = _clean_text(email)
                 if models is not None:
                     item["models"] = _model_ids(models)
+                if _normalize_status(item.get("status")) != "disabled":
+                    item["status"] = "active"
+                item["last_error"] = ""
                 item["last_refresh_at"] = _now()
                 item["updated_at"] = _now()
                 self._save_unlocked(items)
@@ -820,6 +827,10 @@ class XaiCliOAuthAccountStore:
                         item["status"] = "invalid"
                     elif normalized_status in {"valid", "limited"}:
                         item["status"] = "active"
+                if normalized_status in {"valid", "limited"}:
+                    item["last_error"] = ""
+                elif normalized_status == "invalid":
+                    item["last_error"] = _safe_error(result.get("error"), item)
                 item["updated_at"] = now
                 updated_items.append(item)
             if updated_items:

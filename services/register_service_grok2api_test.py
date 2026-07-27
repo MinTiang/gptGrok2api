@@ -440,6 +440,35 @@ class RegisterServiceGrok2APITest(unittest.TestCase):
             )
             self.assertFalse(service._grok_probe_wake_event.is_set())
 
+    def test_oauth_patrol_classifies_reauthorization_and_permission_retry(self) -> None:
+        self.assertTrue(
+            register_service_module._grok_oauth_reauthorization_required(
+                {
+                    "last_error": "xAI CLI OAuth account needs reauthorization",
+                    "probe": {"status": "unknown"},
+                }
+            )
+        )
+        no_quota = {
+            "last_error": "No credits",
+            "probe": {
+                "status": "invalid",
+                "code": "personal-team-blocked:spending-limit",
+            },
+        }
+        self.assertFalse(register_service_module._grok_oauth_reauthorization_required(no_quota))
+        self.assertTrue(register_service_module._grok_oauth_permission_pending(no_quota["probe"]))
+        self.assertTrue(
+            register_service_module._grok_oauth_permission_pending(
+                {"status": "invalid", "code": "permission-denied"}
+            )
+        )
+        self.assertFalse(
+            register_service_module._grok_oauth_permission_pending(
+                {"status": "invalid", "code": "invalid_credentials"}
+            )
+        )
+
     def test_scheduler_runs_due_invalid_oauth_recovery_without_waiting_for_probe_interval(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._service(temp_dir, probe_scheduler={"enabled": True})

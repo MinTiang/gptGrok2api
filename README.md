@@ -17,8 +17,8 @@ GPTGrok2API 是一个自托管的 GPT 与 Grok 统一网关，将已接入的订
 | 协议兼容 | 提供 Chat Completions、Responses、Images、Anthropic Messages 兼容入口，支持流式与非流式响应、工具调用、搜索和推理强度。 |
 | GPT 运行时 | 支持 GPT 文本对话、网页搜索、图片生成、图片编辑、会话复用、文件下载以及 PPT/PSD 等可编辑文件任务。 |
 | Grok SSO 运行时 | 内置 Grok 账号池、额度刷新、账号调度、聊天、Responses、Messages、图片生成、图片编辑、视频生成和媒体缓存。 |
-| Grok 后台探测与恢复 | 服务启动后自动探测已加入运行池的非禁用账号；明确失效时使用已保存邮箱和密码重新登录、验证并替换 SSO，无需手动操作。 |
-| Grok Build OAuth | 支持 Device Code 与公网版 Authorization Code + PKCE 授权、Access/Refresh Token 导入、自动刷新、模型探测以及独立 OAuth 凭据存储；新注册使用公网版 `redirect=cloud-console` 上下文，并在关闭客户端前复用同一个 live `curl_cffi Session` 完成 PKCE，Turnstile 沿用系统打码配置，临时 Cookie 与 OAuth Token 均不写入注册账号文件。 |
+| Grok 后台探测与恢复 | 服务启动后自动巡查已加入运行池的非禁用账号；SSO 明确失效时重新登录，OAuth 明确要求重新授权时进入自动恢复队列，网络和未知错误不改变账号有效状态。 |
+| Grok Build OAuth | 支持 Device Code 与公网版 Authorization Code + PKCE 授权、Access/Refresh Token 导入、自动刷新、模型探测以及独立 OAuth 凭据存储；新注册使用公网版 `redirect=cloud-console` 上下文，并在关闭客户端前复用同一个 live `curl_cffi Session` 完成 PKCE。Turnstile 沿用系统打码配置，Device Code 只有实际到达授权完成状态才会成功，临时 Cookie 与 OAuth Token 均不写入注册账号文件。 |
 | 账号生命周期 | 支持账号导入、分组、标签、额度同步、异常状态识别、限流恢复、无效账号清理、批量操作、代理绑定和运行状态监控。 |
 | iCloud Privacy Mail | 内置 sidecar；新接口负责 Apple 登录、2FA 和创建隐私邮箱，旧接口负责登录、2FA 和同步已有邮箱，IMAP App 专用密码负责取验证码。 |
 | iCloud 定时创建 | 按 Apple 账号定时创建邮箱；新接口每小时最多 20 个、旧接口每小时最多 5 个，每账号累计 750 个后自动停止。sidecar 使用 Compose 内部网络，不需要独立账号或宿主机端口。 |
@@ -65,6 +65,10 @@ Grok 账号探测随服务启动自动在后台运行，无需在账号管理页
 调度器只探测已经加入内置 Grok 运行池、保存了 SSO 且未禁用的账号；探测复用 Fast 配额验证接口，不发送 Console 对话，也不会自动删除或禁用账号。只有运行时明确返回“失效”时才会读取该账号已保存的邮箱和密码重新登录；“未知”通常是超时或临时错误，只记录并等待下一轮。
 
 新 SSO 会先加入运行池并再次验证，确认有效后才删除旧 SSO并原子更新本地账号档案。恢复失败时保留旧档案，按 `1 / 2 / 4 / 8 / 16 / 24` 小时退避重试，最长间隔 `24` 小时。账号列表显示探测结果、恢复状态和恢复时间；恢复记录保存在 `data/grok_accounts.json`，调度完成记录保存在 `data/register.json`。
+
+OAuth 账号由同一套定时巡查负责分类和恢复。刷新接口明确返回 `invalid_grant`、`invalid_token`、`unauthorized_client`，或探测结果为 `xAI CLI OAuth account needs reauthorization` 时，账号才会标记为需要重新授权并进入自动恢复队列；授权获得新 Token 后会清除旧错误，再执行 Grok 4.5 探测与已配置的外部投递。
+
+`402 personal-team-blocked` 表示权限或额度尚未生效，不等同于 OAuth 凭据失效，因此不会重复授权，而是按 `60 / 120 / 300` 秒延迟复检。TLS、代理、网络错误、上游普通 HTTP 错误和无法分类的响应仅记录本次失败，保留账号原状态等待下一轮；探测结果恢复为有效或限流时，历史重新授权错误会自动清除。
 
 ## 内置 Captcha Solver
 

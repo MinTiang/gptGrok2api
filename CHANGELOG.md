@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.1 - 2026-07-27
+
++ [新增] Grok OAuth 定时巡查接入自动恢复队列；检测到 `xAI CLI OAuth account needs reauthorization` 时直接使用账号现有身份重新授权，并在恢复成功后继续模型探测与外部投递。
++ [修复] OAuth 巡查只将 `invalid_grant`、`invalid_token` 和 `unauthorized_client` 判定为凭据失效；TLS、网络故障、普通 HTTP 错误及未知响应仅记录本次失败，不再误伤正常账号。
++ [修复] `402 personal-team-blocked` 不再触发重复授权，改为按 `60 / 120 / 300` 秒延迟复检 Grok 4.5 权限；探测恢复为有效或限流时同步清除历史错误并恢复账号状态。
++ [修复] OAuth Token 轮换后自动清除旧的重新授权错误，避免已恢复账号继续显示失效。
++ [修复] Device Code consent 的重定向必须实际到达授权完成状态才算成功，避免普通 2xx 或中间重定向被误判为授权完成。
+
 ## 1.2.0 - 2026-07-25
 
 + [新增] Grok 注册支持在同一有头浏览器会话内完成中文资料填写、邮箱确认、Turnstile 与账号创建，并增加页面状态诊断、截图和确认邮件兜底。

@@ -152,6 +152,7 @@ class XaiCliOAuthAccountStoreTest(unittest.TestCase):
     def test_subject_deduplicates_refresh_token_rotation_and_preserves_identity(self) -> None:
         first = self.store.upsert(self._payload("first@example.com", "stable-subject", "one"))
         first_created_at = self.store.get(first["item"]["id"])["created_at"]
+        self.store.record_result(first["item"]["id"], False, "OAuth account needs reauthorization")
         second = self.store.upsert(
             self._payload("renamed@example.com", "stable-subject", "two", expires_at="2030-01-01T00:00:00+00:00")
         )
@@ -163,7 +164,30 @@ class XaiCliOAuthAccountStoreTest(unittest.TestCase):
         self.assertEqual(raw["access_token"], "access-two")
         self.assertEqual(raw["refresh_token"], "refresh-two")
         self.assertEqual(raw["created_at"], first_created_at)
+        self.assertEqual(raw["last_error"], "")
         self.assertEqual(self.store.count(), 1)
+
+    def test_probe_result_replaces_stale_error_with_current_outcome(self) -> None:
+        saved = self.store.upsert(self._payload("person@example.com", "subject-one", "one"))["item"]
+        self.store.record_result(saved["id"], False, "OAuth account needs reauthorization")
+
+        invalid = self.store.update_probe_result(
+            saved["id"],
+            status="invalid",
+            model="grok-4.5",
+            http_status=402,
+            code="personal-team-blocked:spending-limit",
+            error="No credits",
+        )
+        self.assertEqual(invalid["last_error"], "No credits")
+
+        valid = self.store.update_probe_result(
+            saved["id"],
+            status="valid",
+            model="grok-4.5",
+            http_status=200,
+        )
+        self.assertEqual(valid["last_error"], "")
 
     def test_round_robin_skips_disabled_accounts_and_honors_exclusions(self) -> None:
         first = self.store.upsert(self._payload("one@example.com", "subject-one", "one"))["item"]
@@ -181,6 +205,8 @@ class XaiCliOAuthAccountStoreTest(unittest.TestCase):
 
     def test_update_tokens_rotates_refresh_token_and_status_controls_selection(self) -> None:
         saved = self.store.upsert(self._payload("person@example.com", "subject-one", "one"))["item"]
+        self.store.record_result(saved["id"], False, "OAuth account needs reauthorization")
+        self.store.set_status([saved["id"]], "invalid")
 
         updated = self.store.update_tokens(
             saved["id"],
@@ -196,6 +222,8 @@ class XaiCliOAuthAccountStoreTest(unittest.TestCase):
         self.assertEqual(raw["refresh_token"], "refresh-two")
         self.assertEqual(raw["id_token"], "id-two")
         self.assertEqual(raw["expires_at"], "2032-01-01T00:00:00+00:00")
+        self.assertEqual(raw["status"], "active")
+        self.assertEqual(raw["last_error"], "")
 
         self.assertEqual(self.store.set_disabled([saved["id"]], True)["updated"], 1)
         self.assertIsNone(self.store.select_next_account())

@@ -274,6 +274,40 @@ class DeviceConsentFormTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.stage, "approve")
 
+    def test_direct_approve_redirect_without_done_falls_back_to_consent_form(self) -> None:
+        verify = MagicMock(
+            status_code=302,
+            url="https://auth.x.ai/oauth2/device/verify",
+            headers={"location": "https://accounts.x.ai/oauth2/device/consent"},
+            text="",
+        )
+        verify.json.return_value = {}
+        approve = MagicMock(
+            status_code=302,
+            url="https://auth.x.ai/oauth2/device/approve",
+            headers={"location": "https://accounts.x.ai/oauth2/device/consent"},
+            text="",
+        )
+        approve.json.return_value = {}
+        follow = MagicMock(
+            status_code=200,
+            url="https://accounts.x.ai/oauth2/device/consent",
+            headers={},
+            text="<html>consent</html>",
+        )
+        follow.json.return_value = {}
+        client = MagicMock()
+        client._request.side_effect = [verify, approve, follow]
+
+        completed, consent_url = XaiDeviceOAuthProtocol._approve_device_direct(
+            client,
+            "ABCD-EFGH",
+            stage="sso",
+        )
+
+        self.assertFalse(completed)
+        self.assertEqual(consent_url, "https://accounts.x.ai/oauth2/device/consent")
+
     def test_unsupported_direct_approve_falls_back_to_consent_form(self) -> None:
         def response(*, status: int = 200, url: str = "", headers=None, payload=None, text: str = ""):
             item = MagicMock()
