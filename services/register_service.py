@@ -709,6 +709,7 @@ class RegisterService:
         self._grok_oauth_protocol_sink = grok_oauth_protocol_sink
         self._lock = threading.RLock()
         self._runner: threading.Thread | None = None
+        self._register_stop_event = threading.Event()
         self._grok_probe_running = False
         self._grok_probe_scheduler_thread: threading.Thread | None = None
         self._grok_probe_wake_event = threading.Event()
@@ -1011,12 +1012,17 @@ class RegisterService:
     def start(self) -> dict:
         with self._lock:
             if self._runner and self._runner.is_alive():
+                if self._register_stop_event.is_set() or not self._config.get("enabled"):
+                    self._append_log("上一次注册任务仍在退出，请等待其结束后再启动", "yellow")
+                    return self.get()
                 self._config["enabled"] = True
                 self._save()
                 return self.get()
             target = str(self._config.get("target") or "openai")
             self._sync_icloud_claims()
             backend = self._sync_backend_config(target)
+            self._register_stop_event = threading.Event()
+            backend.config["_stop_event"] = self._register_stop_event
             self._config["enabled"] = True
             self._drop_mail_proxy()
             self._logs = []
@@ -1046,7 +1052,7 @@ class RegisterService:
             self._save()
             self._runner = threading.Thread(
                 target=self._run,
-                args=(target, backend),
+                args=(target, backend, None, self._register_stop_event),
                 daemon=True,
                 name=f"{target}-register",
             )
@@ -1076,6 +1082,7 @@ class RegisterService:
     def stop(self) -> dict:
         with self._lock:
             self._config["enabled"] = False
+            self._register_stop_event.set()
             self._config["stats"]["updated_at"] = _now()
             self._save()
             self._append_log("已请求停止注册任务，正在等待当前运行任务结束", "yellow")
@@ -1252,6 +1259,8 @@ class RegisterService:
             runtime["total"] = len(selected_credentials)
             runtime["threads"] = min(max(1, int(runtime.get("threads") or 1)), len(selected_credentials))
             backend = self._sync_backend_runtime(runtime)
+            self._register_stop_event = threading.Event()
+            backend.config["_stop_event"] = self._register_stop_event
 
             cleared = mail_provider.clear_outlook_token_states(
                 [item["email"] for item in selected_credentials],
@@ -1285,7 +1294,7 @@ class RegisterService:
             run_options = {"mode": "total", "total": len(selected_credentials), "threads": runtime["threads"]}
             self._runner = threading.Thread(
                 target=self._run,
-                args=(target, backend, run_options),
+                args=(target, backend, run_options, self._register_stop_event),
                 daemon=True,
                 name=f"{target}-outlook-retry",
             )
@@ -4180,8 +4189,15 @@ class RegisterService:
             self._config["stats"]["updated_at"] = _now()
             self._save()
 
-    def _run(self, target: str, backend, run_options: dict[str, Any] | None = None) -> None:
+    def _run(
+        self,
+        target: str,
+        backend,
+        run_options: dict[str, Any] | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> None:
         options = dict(run_options or {})
+        stop_event = stop_event or self._register_stop_event
         threads = max(1, int(options.get("threads") or self.get()["threads"]))
         submitted, done, success, fail = 0, 0, 0, 0
         with ThreadPoolExecutor(max_workers=threads) as executor:
@@ -4192,7 +4208,12 @@ class RegisterService:
                 cfg.update(options)
                 if target == "grok":
                     cfg["mode"] = "total"
-                while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:
+                while (
+                    self.get()["enabled"]
+                    and not stop_event.is_set()
+                    and not self._target_reached(cfg, submitted)
+                    and len(futures) < threads
+                ):
                     submitted += 1
                     futures.add(executor.submit(backend.worker, submitted))
                 self._bump(running=len(futures), done=done, success=success, fail=fail)
@@ -4226,7 +4247,8 @@ class RegisterService:
                         self._append_log(f"任务结果处理失败: {type(exc).__name__}: {exc}", "red")
         self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
         with self._lock:
-            self._config["enabled"] = False
+            if self._register_stop_event is stop_event:
+                self._config["enabled"] = False
             self._save()
         if target == "grok":
             self._append_log(f"Grok 注册任务已结束：成功 {success}，失败 {fail}", "yellow")

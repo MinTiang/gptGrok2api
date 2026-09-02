@@ -614,7 +614,11 @@ def _mail_config(register_proxy: str = "") -> dict:
     mail = config["mail"] if isinstance(config.get("mail"), dict) else {}
     use_register_proxy = _truthy(mail.get("api_use_register_proxy"), True)
     proxy = str(register_proxy or "").strip() if use_register_proxy else ""
-    return {**mail, "api_use_register_proxy": use_register_proxy, "proxy": proxy}
+    result = {**mail, "api_use_register_proxy": use_register_proxy, "proxy": proxy}
+    stop_event = config.get("_stop_event")
+    if stop_event is not None:
+        result["_stop_event"] = stop_event
+    return result
 
 
 def _checkout_config() -> dict[str, Any]:
@@ -791,10 +795,13 @@ def wait_for_code(
     *,
     wait_timeout: float | None = None,
 ) -> str | None:
+    stop_event = config.get("_stop_event")
+    extra = {"stop_event": stop_event} if stop_event is not None else {}
     return mail_provider.wait_for_code(
         _mail_config(register_proxy),
         mailbox,
         wait_timeout=wait_timeout,
+        **extra,
     )
 
 
@@ -1302,6 +1309,11 @@ class PlatformRegistrar:
         self.session = create_session(self.proxy, self.fingerprint)
         self.clearance_user_agent = ""
         self.clearance_failure_reason = ""
+        # A clearance challenge is not recoverable by repeatedly asking
+        # FlareSolverr for the same proxy/host.  Keep the retry budget local to
+        # one registration session so a blocked session fails promptly rather
+        # than spending ~60s on every subsequent endpoint.
+        self._clearance_refresh_attempted_hosts: set[str] = set()
         self.device_id = str(uuid.uuid4())
         self.code_verifier = ""
         self.platform_auth_code = ""
@@ -1339,6 +1351,14 @@ class PlatformRegistrar:
 
     def _refresh_cloudflare_clearance(self, target_url: str, index: int) -> ClearanceBundle | None:
         self.clearance_failure_reason = ""
+        target_host = (urlparse(str(target_url or "")).hostname or str(target_url or "")).strip().lower()
+        if target_host in self._clearance_refresh_attempted_hosts:
+            self.clearance_failure_reason = (
+                f"本次注册已刷新过 {target_host} 的 clearance，重试仍被拦截；请更换 IP/代理后重试"
+            )
+            step(index, f"跳过重复的 Cloudflare clearance 刷新：{self.clearance_failure_reason}", "yellow")
+            return None
+        self._clearance_refresh_attempted_hosts.add(target_host)
         profile = proxy_settings.get_profile(proxy=self.proxy, upstream=True)
         if not profile.clearance_enabled:
             self.clearance_failure_reason = (
@@ -3017,12 +3037,18 @@ def _register_with_fresh_email(index: int) -> tuple[PlatformRegistrar, dict]:
     excluded_provider_refs: set[str] = set()
     provider_count = max(1, _enabled_mail_provider_count())
     while True:
+        stop_event = config.get("_stop_event")
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("注册任务已停止")
         registrar = PlatformRegistrar(config["proxy"])
         registrar.excluded_mail_provider_refs = set(excluded_provider_refs)
         try:
             return registrar, registrar.register(index)
         except OpenAIMailboxDeliveryTimeout as error:
             registrar.close()
+            stop_event = config.get("_stop_event")
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("注册任务已停止") from error
             delivery_failures += 1
             if error.provider_ref:
                 excluded_provider_refs.add(error.provider_ref)

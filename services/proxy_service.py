@@ -521,7 +521,18 @@ class ProxySettingsStore:
         if not lock.acquire(blocking=False):
             with lock:
                 pass
-            return self._get_cached_bundle(key) or cached_before
+            refreshed = self._get_cached_bundle(key)
+            if force:
+                # Another caller may have completed the in-flight refresh.
+                # Accept the bundle only when it is newer than the one that
+                # triggered this forced refresh; otherwise report failure
+                # instead of returning stale clearance as a success.
+                if refreshed is not None and (
+                    cached_before is None or refreshed.created_at > cached_before.created_at
+                ):
+                    return refreshed
+                return None
+            return refreshed or cached_before
 
         try:
             cached_now = self._get_cached_bundle(key)
@@ -546,6 +557,14 @@ class ProxySettingsStore:
                     )
                 self._set_cached_bundle(key, new_bundle)
                 return new_bundle
+            # A forced refresh is requested after an upstream 403/challenge.
+            # Returning an old bundle here makes callers believe that the
+            # clearance was refreshed successfully, even though the same
+            # stale cookies will immediately be retried.  Keep the fallback
+            # only for normal (non-forced) refreshes; forced callers must be
+            # able to distinguish a real refresh from a failure.
+            if force:
+                return None
             return cached_now or cached_before
         finally:
             lock.release()

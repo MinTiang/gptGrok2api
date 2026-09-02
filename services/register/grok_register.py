@@ -119,6 +119,9 @@ def _mail_config(register_proxy: str) -> dict[str, Any]:
     use_register_proxy = _truthy(mail.get("api_use_register_proxy"), True)
     mail["api_use_register_proxy"] = use_register_proxy
     mail["proxy"] = str(register_proxy or "").strip() if use_register_proxy else ""
+    stop_event = config.get("_stop_event")
+    if stop_event is not None:
+        mail["_stop_event"] = stop_event
     providers = mail.get("providers") if isinstance(mail.get("providers"), list) else []
     for provider in providers:
         if not isinstance(provider, dict):
@@ -303,7 +306,11 @@ def _register_once(
         client.bootstrap()
         client.send_email_validation_code(email)
         step(index, f"验证码已发送，等待邮件：{email}")
-        code = mail_provider.wait_for_code(mail_config, mailbox)
+        code = mail_provider.wait_for_code(
+            mail_config,
+            mailbox,
+            stop_event=mail_config.get("_stop_event"),
+        )
         if not code:
             raise GrokProtocolError("等待 Grok 验证码超时", stage="mail", mail_retryable=True)
         code_text = str(code)
@@ -425,6 +432,9 @@ def worker(index: int) -> dict[str, Any]:
         mail_config = _mail_config(proxy)
         max_attempts = _max_mail_retries(grok_config)
         for attempt in range(1, max_attempts + 1):
+            stop_event = config.get("_stop_event")
+            if stop_event is not None and stop_event.is_set():
+                raise GrokProtocolError("注册任务已停止", stage="cancelled", mail_retryable=False)
             client = GrokProtocolClient(grok_config, proxy=proxy, log=lambda message: debug_step(index, message))
             try:
                 result = _register_once(index, client, mail_config, attempt, max_attempts)
@@ -433,6 +443,9 @@ def worker(index: int) -> dict[str, Any]:
                 return {"ok": True, "index": index, "result": result}
             except Exception as error:
                 last_error = error
+                stop_event = config.get("_stop_event")
+                if stop_event is not None and stop_event.is_set():
+                    raise GrokProtocolError("注册任务已停止", stage="cancelled", mail_retryable=False) from error
                 if attempt >= max_attempts or not _mail_retryable(error):
                     raise
                 client.close()

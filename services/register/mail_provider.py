@@ -1016,14 +1016,24 @@ class BaseMailProvider:
         self.provider_ref = provider_ref
 
     def wait_for(self, mailbox: dict[str, Any], on_message: Callable[[dict[str, Any]], ResultT | None]) -> ResultT | None:
+        stop_event = mailbox.get("_stop_event")
         deadline = time.monotonic() + self.conf["wait_timeout"]
         while time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                return None
             message = self.fetch_latest_message(mailbox)
+            if stop_event is not None and stop_event.is_set():
+                return None
             if message:
                 result = on_message(message)
                 if result is not None:
                     return result
-            time.sleep(max(0.2, self.conf["wait_interval"]))
+            interval = max(0.2, self.conf["wait_interval"])
+            if stop_event is not None:
+                if stop_event.wait(interval):
+                    return None
+            else:
+                time.sleep(interval)
         return None
 
     def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
@@ -2972,11 +2982,14 @@ class OutlookTokenProvider(BaseMailProvider):
         seen_refs = {str(item) for item in seen_value}
 
         deadline = time.monotonic() + self.conf["wait_timeout"]
+        stop_event = mailbox.get("_stop_event")
         target_address = str(mailbox.get("address") or "").strip()
         last_transient_error: Exception | None = None
         transient_failures = 0
         successful_reads = 0
         while time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                return None
             try:
                 messages = self.fetch_recent_messages(mailbox)
                 successful_reads += 1
@@ -2988,7 +3001,12 @@ class OutlookTokenProvider(BaseMailProvider):
                 last_transient_error = error
                 transient_failures += 1
                 base_interval = max(0.2, self.conf["wait_interval"])
-                time.sleep(min(15.0, base_interval * transient_failures))
+                delay = min(15.0, base_interval * transient_failures)
+                if stop_event is not None:
+                    if stop_event.wait(delay):
+                        return None
+                else:
+                    time.sleep(delay)
                 continue
             for message in messages:
                 if _message_before_code_boundary(mailbox, message):
@@ -3015,7 +3033,12 @@ class OutlookTokenProvider(BaseMailProvider):
                     seen_value.append(ref)
                     return code
                 seen_refs.add(ref)
-            time.sleep(max(0.2, self.conf["wait_interval"]))
+            delay = max(0.2, self.conf["wait_interval"])
+            if stop_event is not None:
+                if stop_event.wait(delay):
+                    return None
+            else:
+                time.sleep(delay)
         if last_transient_error is not None and successful_reads == 0:
             raise RuntimeError(f"OutlookToken 邮箱查询持续失败: {last_transient_error}") from last_transient_error
         return None
@@ -3153,9 +3176,17 @@ def sync_icloud_claims(mail_config: dict, project: str, emails: list[str]) -> di
         provider.close()
 
 
-def wait_for_code(mail_config: dict, mailbox: dict, *, wait_timeout: float | None = None) -> str | None:
+def wait_for_code(
+    mail_config: dict,
+    mailbox: dict,
+    *,
+    wait_timeout: float | None = None,
+    stop_event: Any | None = None,
+) -> str | None:
     provider = _create_provider(mail_config, str(mailbox.get("provider") or ""), str(mailbox.get("provider_ref") or ""))
     try:
+        if stop_event is not None:
+            mailbox["_stop_event"] = stop_event
         if wait_timeout is not None:
             provider.conf = {**provider.conf, "wait_timeout": max(1.0, float(wait_timeout))}
         return provider.wait_for_code(mailbox)

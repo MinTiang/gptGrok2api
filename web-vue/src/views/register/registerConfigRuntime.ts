@@ -313,6 +313,10 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
       }
       const response = starting ? await registerApi.startLegacy() : await registerApi.stopLegacy()
       applyConfig(response.register)
+      if (starting && !response.register?.enabled) {
+        input.notifyError('上一次注册任务仍在退出，请稍后再启动')
+        return
+      }
       input.notifySuccess(starting ? '注册任务已启动' : '注册任务已停止')
       if (starting) input.startLiveUpdates?.()
     } catch (error: any) {
