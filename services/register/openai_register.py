@@ -1371,6 +1371,9 @@ class PlatformRegistrar:
             target_url=target_url,
             proxy=self.proxy,
             force=True,
+            # All registration threads using the same proxy share this
+            # cooldown, so only the first one waits on FlareSolverr.
+            force_cooldown_sec=max(30.0, min(float(profile.timeout_sec), 60.0)),
             upstream=True,
         )
         if bundle is not None:

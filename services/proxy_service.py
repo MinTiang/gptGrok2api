@@ -261,6 +261,7 @@ class ProxySettingsStore:
         self._config = config_store or config
         self._clearance_provider_factory = clearance_provider_factory or FlareSolverrClearanceProvider
         self._clearance_cache: dict[tuple[str, str], ClearanceBundle] = {}
+        self._clearance_last_attempt_at: dict[tuple[str, str], float] = {}
         self._provider_cache: dict[str, FlareSolverrClearanceProvider] = {}
         self._flight_locks: dict[tuple[str, str], threading.Lock] = {}
         self._egress_inflight: dict[str, int] = {}
@@ -497,6 +498,7 @@ class ProxySettingsStore:
         proxy: str = "",
         resource: bool = False,
         force: bool = False,
+        force_cooldown_sec: float = 0,
         upstream: bool = True,
     ) -> ClearanceBundle | None:
         profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
@@ -539,9 +541,28 @@ class ProxySettingsStore:
             if cached_now is not None and not force and cached_now.is_valid_for(target_host, profile.proxy_url):
                 return cached_now
 
+            # Registration workers share one proxy/target cache.  Once one
+            # forced refresh has completed, do not make every concurrent
+            # worker invoke FlareSolverr again for the same challenge.  A
+            # recent bundle is returned (or None after a failed attempt), and
+            # a new attempt becomes eligible after the cooldown expires.
+            try:
+                cooldown = max(0.0, float(force_cooldown_sec or 0))
+            except (TypeError, ValueError):
+                cooldown = 0.0
+            if force and cooldown > 0:
+                with self._lock:
+                    last_attempt = self._clearance_last_attempt_at.get(key, 0.0)
+                if last_attempt and time.time() - last_attempt < cooldown:
+                    return cached_now
+
             flaresolverr_url = str(profile.clearance.get("flaresolverr_url") or "").strip()
             provider = self._get_provider(flaresolverr_url)
-            new_bundle = provider.get_clearance(target_url, proxy_url=profile.proxy_url, timeout_sec=profile.timeout_sec)
+            try:
+                new_bundle = provider.get_clearance(target_url, proxy_url=profile.proxy_url, timeout_sec=profile.timeout_sec)
+            finally:
+                with self._lock:
+                    self._clearance_last_attempt_at[key] = time.time()
             if new_bundle is not None:
                 expires_at = time.time() + profile.refresh_interval if profile.refresh_interval else None
                 if (
@@ -582,6 +603,7 @@ class ProxySettingsStore:
         key = self._cache_key(profile.proxy_url, target_host)
         with self._lock:
             self._clearance_cache.pop(key, None)
+            self._clearance_last_attempt_at.pop(key, None)
 
     def get_runtime_status(self) -> dict[str, object]:
         profile = self.get_profile(upstream=True)
