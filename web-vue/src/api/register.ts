@@ -47,6 +47,7 @@ export type RegisterProvider = {
   local_compose?: boolean
   project?: string
   purpose?: string
+  poll_interval?: number
   keyword?: string
   wait_ms?: number
   use_proxy?: boolean

@@ -126,6 +126,30 @@
           />
         </label>
 
+        <label v-if="currentType === 'luckygmail'" class="register-field">
+          <span class="register-label">用途标识</span>
+          <Input
+            :model-value="provider.purpose"
+            block
+            :disabled="disabled"
+            placeholder="google"
+            @update:model-value="value => emit('update-field', index, 'purpose', String(value || '').trim())"
+          />
+        </label>
+
+        <label v-if="currentType === 'luckygmail'" class="register-field">
+          <span class="register-label">轮询间隔 (秒)</span>
+          <Input
+            :model-value="provider.poll_interval"
+            type="number"
+            min="2"
+            step="1"
+            block
+            :disabled="disabled"
+            @update:model-value="value => emit('update-field', index, 'poll_interval', numberModelValue(value))"
+          />
+        </label>
+
         <label v-if="currentType === 'icloud_api' || currentType === 'icloud_local'" class="register-field">
           <span class="register-label">项目</span>
           <Input
@@ -347,6 +371,7 @@
           </Checkbox>
         </label>
       </div>
+      <p v-if="currentType === 'luckygmail'" class="register-preview-line">创建、获取邮件共用 RPM 限制，当前进程会自动保证每个 API Base 的请求间隔不少于 2 秒。</p>
     </div>
 
     <div v-if="currentType === 'gptmail'" class="register-provider-section register-provider-section--soft">

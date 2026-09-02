@@ -1440,6 +1440,7 @@ class PlatformRegistrar:
         provider_label = {
             "icloud_api": "iCloud 邮箱",
             "icloud_local": "iCloud 邮箱",
+            "luckygmail": "LuckyGmail",
             "outlook_token": "Microsoft 邮箱",
         }.get(provider, "当前邮箱")
         step(index, f"提交 {provider_label}进入登录验证")

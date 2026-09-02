@@ -536,6 +536,12 @@ cloudmail_token_cache: dict[str, tuple[str, float]] = {}
 gptmail_status_lock = Lock()
 gptmail_status_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
+# luckygmail 的创建、获取邮件和拉黑接口共享 RPM 限制。不同注册任务可能
+# 各自创建 provider 实例，因此按 API Base 做进程内节流，而不是只依赖单个
+# provider 的 wait_interval。
+luckygmail_rate_lock = Lock()
+luckygmail_last_request_at: dict[str, float] = {}
+
 GPTMAIL_DEFAULT_API_BASE = "https://mail.chatgpt.org.uk"
 GPTMAIL_PUBLIC_STATUS_CACHE_SECONDS = 60
 GPTMAIL_CUSTOM_STATUS_CACHE_SECONDS = 30
@@ -1651,6 +1657,140 @@ class GptMailProvider(BaseMailProvider):
         if item.get("id"):
             item = self._request("GET", f"/api/email/{item['id']}")
         return {"provider": self.name, "mailbox": mailbox["address"], "message_id": str(item.get("id") or ""), "subject": str(item.get("subject") or ""), "sender": str(item.get("from_address") or ""), "text_content": str(item.get("content") or ""), "html_content": str(item.get("html_content") or ""), "received_at": _parse_received_at(item.get("timestamp") or item.get("created_at")), "raw": item}
+
+    def close(self) -> None:
+        self.session.close()
+
+
+class LuckyGmailProvider(BaseMailProvider):
+    """luckygmail 临时邮箱 API provider。
+
+    API 文档中的 acquire/fetch 均使用 Bearer API Key。fetch 接口本身提供
+    未读语义，这里额外记录已返回的邮件 id，兼容上游部署返回重复数据的情况。
+    """
+
+    name = "luckygmail"
+    min_request_interval = 2.0
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "").strip().rstrip("/")
+        self.api_key = str(entry.get("api_key") or "").strip()
+        self.purpose = str(entry.get("purpose") or "google").strip()
+        configured_interval = entry.get("poll_interval", self.min_request_interval)
+        try:
+            configured_interval = float(configured_interval)
+        except (TypeError, ValueError):
+            configured_interval = self.min_request_interval
+        self.request_interval = max(self.min_request_interval, configured_interval)
+        # BaseMailProvider 轮询间隔也需要满足 luckygmail 的最低建议值。
+        self.conf = {**conf, "wait_interval": max(self.min_request_interval, float(conf.get("wait_interval") or 0))}
+        self.session = _create_session(conf)
+        self.session.headers.update({
+            "User-Agent": conf["user_agent"],
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        })
+
+    def _throttle(self) -> None:
+        now = time.monotonic()
+        with luckygmail_rate_lock:
+            last = luckygmail_last_request_at.get(self.api_base, 0.0)
+            delay = self.request_interval - (now - last)
+            if delay > 0:
+                time.sleep(delay)
+                now = time.monotonic()
+            luckygmail_last_request_at[self.api_base] = now
+
+    def _request(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.api_base:
+            raise RuntimeError("luckygmail 缺少 API Base")
+        if not self.api_key:
+            raise RuntimeError("luckygmail 缺少 API Key")
+        self._throttle()
+        try:
+            response = self.session.request(
+                "POST",
+                f"{self.api_base}{path}",
+                json=payload,
+                timeout=self.conf["request_timeout"],
+                verify=False,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"luckygmail 请求失败: {path}, error={exc}") from exc
+        try:
+            data = response.json()
+        except Exception as exc:
+            raise RuntimeError(
+                f"luckygmail 请求失败: {path}, HTTP {response.status_code}, body={response.text[:300]}"
+            ) from exc
+        if response.status_code < 200 or response.status_code >= 300:
+            message = data.get("message") if isinstance(data, dict) else ""
+            raise RuntimeError(
+                f"luckygmail 请求失败: {path}, HTTP {response.status_code}, {message or response.text[:300]}"
+            )
+        if not isinstance(data, dict) or data.get("success") is not True:
+            message = data.get("message") if isinstance(data, dict) else ""
+            raise RuntimeError(f"luckygmail 请求失败: {path}, {message or '返回 success=false'}")
+        return data
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if self.purpose:
+            payload["purpose"] = self.purpose
+        data = self._request("/api/email/acquire", payload)
+        item = data.get("data") if isinstance(data.get("data"), dict) else {}
+        address = str(item.get("address") or "").strip()
+        if not address:
+            raise RuntimeError("luckygmail 获取邮箱响应缺少 address")
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "domain": str(item.get("domain") or "").strip(),
+            "expires_at": item.get("expires_at"),
+            "purpose": self.purpose,
+        }
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        address = str(mailbox.get("address") or "").strip()
+        if not address:
+            raise RuntimeError("luckygmail 缺少 address")
+        data = self._request("/api/email/fetch", {"address": address})
+        item = data.get("data") if isinstance(data.get("data"), dict) else {}
+        if item.get("has_mail") is not True:
+            return None
+        mail = item.get("mail") if isinstance(item.get("mail"), dict) else {}
+        if not mail:
+            return None
+        message_id = str(mail.get("id") or "").strip()
+        seen_ids = mailbox.setdefault("_luckygmail_seen_ids", [])
+        if not isinstance(seen_ids, list):
+            seen_ids = []
+            mailbox["_luckygmail_seen_ids"] = seen_ids
+        if message_id and message_id in {str(value) for value in seen_ids}:
+            return None
+        if message_id:
+            seen_ids.append(message_id)
+        text_content, html_content = _extract_content({
+            "text": mail.get("text"),
+            "html": mail.get("html"),
+        })
+        sender = mail.get("sender") or mail.get("from") or ""
+        if isinstance(sender, dict):
+            sender = sender.get("address") or sender.get("email") or sender.get("name") or ""
+        return {
+            "provider": self.name,
+            "mailbox": address,
+            "message_id": message_id,
+            "subject": str(mail.get("subject") or ""),
+            "sender": str(sender),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at(mail.get("received_at") or mail.get("receivedAt")),
+            "raw": mail,
+        }
 
     def close(self) -> None:
         self.session.close()
@@ -2942,6 +3082,8 @@ def _create_provider(
         return DuckMailProvider(entry, conf)
     if entry["type"] == "gptmail":
         return GptMailProvider(entry, conf)
+    if entry["type"] == "luckygmail":
+        return LuckyGmailProvider(entry, conf)
     if entry["type"] in {"donemail", "done_mail"}:
         return DoneMailProvider(entry, conf)
     if entry["type"] in {"icloud_api", "icloud_local"}:

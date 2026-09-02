@@ -48,6 +48,7 @@ export const providerTypeOptions = [
   { value: 'inbucket', label: 'Inbucket' },
   { value: 'duckmail', label: 'DuckMail' },
   { value: 'gptmail', label: 'GPTMail' },
+  { value: 'luckygmail', label: 'LuckyGmail' },
   { value: 'icloud_api', label: 'iCloud Privacy Mail' },
   { value: 'icloud_local', label: 'iCloud 邮箱（本系统）' },
   { value: 'donemail', label: 'DoneMail' },
@@ -130,6 +131,7 @@ export const providerTypeKeys: Record<string, string[]> = {
   inbucket: ['api_base', 'domain', 'random_subdomain'],
   duckmail: ['api_key', 'default_domain'],
   gptmail: ['key_mode', 'api_key', 'default_domain', 'local_compose'],
+  luckygmail: ['api_base', 'api_key', 'purpose', 'poll_interval'],
   icloud_api: ['api_base', 'api_key', 'project', 'purpose', 'keyword', 'wait_ms', 'use_proxy'],
   icloud_local: ['project', 'purpose', 'keyword', 'wait_ms'],
   donemail: ['api_base', 'admin_key', 'domain', 'email_prefix', 'message_limit'],
@@ -359,6 +361,8 @@ export function defaultProvider(type = 'cloudmail_gen'): RegisterProvider {
       return { ...base, api_key: '', default_domain: 'duckmail.sbs' }
     case 'gptmail':
       return { ...base, key_mode: 'public', api_key: '', default_domain: '', local_compose: false }
+    case 'luckygmail':
+      return { ...base, api_base: '', api_key: '', purpose: 'google', poll_interval: 2 }
     case 'icloud_api':
       return {
         ...base,
@@ -805,6 +809,10 @@ export function providerRequirementMessages(provider: RegisterProvider) {
       if (!providerUsesPublicGptMailKey(provider)) requireValue(provider.api_key, 'API Key')
       if (provider.local_compose) requireValue(provider.default_domain, '默认域名')
       break
+    case 'luckygmail':
+      requireValue(provider.api_base, 'API Base')
+      requireValue(provider.api_key, 'API Key')
+      break
     case 'icloud_api':
       requireValue(provider.api_base, 'iCloud API Base')
       requireValue(provider.api_key, 'API Key')
@@ -837,11 +845,11 @@ export function providerRequirementMessages(provider: RegisterProvider) {
 }
 
 export function providerUsesApiBase(provider: RegisterProvider) {
-  return ['cloudmail_gen', 'cloudflare_temp_email', 'moemail', 'inbucket', 'yyds_mail', 'ddg_mail', 'donemail', 'icloud_api'].includes(providerType(provider))
+  return ['cloudmail_gen', 'cloudflare_temp_email', 'moemail', 'inbucket', 'yyds_mail', 'ddg_mail', 'donemail', 'icloud_api', 'luckygmail'].includes(providerType(provider))
 }
 
 export function providerUsesApiKey(provider: RegisterProvider) {
-  return ['tempmail_lol', 'moemail', 'duckmail', 'gptmail', 'yyds_mail', 'icloud_api'].includes(providerType(provider))
+  return ['tempmail_lol', 'moemail', 'duckmail', 'gptmail', 'yyds_mail', 'icloud_api', 'luckygmail'].includes(providerType(provider))
 }
 
 export function providerUsesAdminPassword(provider: RegisterProvider) {
@@ -862,6 +870,7 @@ export function apiBaseLabel(provider: RegisterProvider) {
   if (type === 'ddg_mail') return 'CF API Base'
   if (type === 'donemail') return 'DoneMail URL'
   if (type === 'icloud_api') return 'iCloud API Base'
+  if (type === 'luckygmail') return 'LuckyGmail API Base'
   return 'API Base'
 }
 
@@ -870,6 +879,7 @@ export function apiBasePlaceholder(provider: RegisterProvider) {
   if (type === 'donemail') return 'https://sow.us.kg'
   if (type === 'yyds_mail') return 'https://maliapi.215.im/v1'
   if (type === 'icloud_api') return 'http://127.0.0.1:8787'
+  if (type === 'luckygmail') return 'http://your-luckygmail-host'
   return ''
 }
 

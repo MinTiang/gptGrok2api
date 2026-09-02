@@ -23,7 +23,7 @@ GPTGrok2API 是一个自托管的 GPT 与 Grok 统一网关，将已接入的订
 | iCloud Privacy Mail | 内置 sidecar；新接口负责 Apple 登录、2FA 和创建隐私邮箱，旧接口负责登录、2FA 和同步已有邮箱，IMAP App 专用密码负责取验证码。 |
 | iCloud 定时创建 | 按 Apple 账号定时创建邮箱；新接口每小时最多 20 个、旧接口每小时最多 5 个，每账号累计 750 个后自动停止。sidecar 使用 Compose 内部网络，不需要独立账号或宿主机端口。 |
 | 邮箱平台标签 | 同一邮箱可分别标记 GPT 和 Grok；GPT 标签为绿色、Grok 标签为蓝色，两个标签同时存在才算已使用，注册领取按目标平台隔离。 |
-| 注册中心 | 支持 OpenAI 与 Grok 注册任务，整合临时邮箱、GPTMail、Outlook Token、Microsoft Alias 和 iCloud Privacy Mail；内置 iCloud provider 不需要填写域名、API Base 或 API Key。 |
+| 注册中心 | 支持 OpenAI 与 Grok 注册任务，整合临时邮箱、GPTMail、LuckyGmail、Outlook Token、Microsoft Alias 和 iCloud Privacy Mail；内置 iCloud provider 不需要填写域名、API Base 或 API Key。 |
 | 本地 Captcha Solver | 源码内置于 `captcha-solver/`，使用 Docker/Xvfb 中的有头 CloakBrowser/Chromium 处理 Grok Turnstile，支持动态并发、代理透传和浏览器资源回收，不需要额外克隆第二个仓库。 |
 | Checkout 提链 | 注册 Checkout 仅保留 UPI 最终支付链接提取；IN Checkout、Provider、Approve 共享同一 sticky 出口，VN Promotion 使用独立代理持续轮换重试。 |
 | 代理与稳定出口 | 支持全局代理、账号代理、代理配置、代理组、节点并发限制、故障反馈、备用出口、WARP、Privoxy、FlareSolverr 和 Clearance 刷新。 |
@@ -47,6 +47,8 @@ docker compose -f docker-compose.warp.yml --profile local-icloud up -d
 主应用通过内部网络访问 sidecar；通常无需额外配置 `ICLOUD_PRIVACY_MAIL_BASE_URL`。进入控制台“iCloud 邮箱”后，直接按页面流程完成 Apple 新/旧接口 2FA：新接口用于创建隐私邮箱，旧接口用于同步已有隐私邮箱；iCloud App 专用密码仅用于 IMAP 取验证码。历史版本产生的未绑定邮箱会在 sidecar 重启时按当前 Apple 登录态自动补齐归属，不会改变邮箱地址、API token 或 GPT/Grok 领取记录。
 
 注册区的邮箱 provider 有两种 iCloud 入口：`iCloud 邮箱（本系统）` 直接使用当前模块创建邮箱和取码，不需要填写 API Base、API Key 或域名；`iCloud API` 继续保留给独立部署的外部服务。已有 GPT 邮箱会显示绿色“GPT 已注册”标签，已有 Grok 邮箱会显示蓝色“Grok 已注册”标签；注册流程会按目标平台领取未标记邮箱，成功后写入对应标签，失败会释放该平台标签。
+
+LuckyGmail 可在注册中心新增 `LuckyGmail` provider：填写服务根地址（例如 `http://luckygmail.example.com`）和控制台创建的 `sk-...` API Key，`purpose` 默认使用 `google`。创建邮箱与轮询取信共用 RPM 限制，当前进程会按 API Base 自动将请求间隔限制为至少 2 秒；服务有效期和邮件已读语义由 LuckyGmail API 管理。
 
 定时创建按账号执行：新接口每个账号每小时最多 `20` 个，旧接口每个账号每小时最多 `5` 个；两种登录态都保存后每小时最多 `25` 个。每个账号累计达到 `750` 个后自动停止该账号，所有账号达到目标后定时器自动结束。控制台支持按选中账号启动定时创建，默认每 `60` 分钟执行一轮；邮箱卡片可直接查看或复制邮箱地址、单邮箱 API 及 `邮箱----API` 组合。
 
