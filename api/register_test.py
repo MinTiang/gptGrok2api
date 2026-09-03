@@ -71,6 +71,23 @@ class RegisterGrokAccountsApiTest(unittest.TestCase):
         )
         list_accounts.assert_called_once_with(keyword="example", status="active")
 
+    def test_update_register_config_accepts_cpa_sync_settings(self) -> None:
+        payload = {
+            "target": "openai",
+            "cpa_sync": {"enabled": True, "pool_id": "cpa-primary"},
+        }
+        saved_config = {**payload, "enabled": False}
+        with patch.object(register_api, "require_admin"), patch.object(
+            register_api.register_service,
+            "update",
+            return_value=saved_config,
+        ) as update_config:
+            response = self.client.post("/api/register", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"register": saved_config})
+        update_config.assert_called_once_with(payload)
+
     def test_grok_probe_polling_toggle_uses_persistent_service_setting(self) -> None:
         status = {"enabled": True, "running": False, "next_run_at": "2030-01-01T00:00:00+00:00"}
         with patch.object(register_api, "require_admin"), patch.object(

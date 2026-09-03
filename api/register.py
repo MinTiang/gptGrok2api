@@ -21,6 +21,7 @@ class RegisterConfigRequest(BaseModel):
     mail: dict | None = None
     checkout: dict | None = None
     sub2api_sync: dict | None = None
+    cpa_sync: dict | None = None
     agent_identity_archive: dict | None = None
     proxy: str | None = None
     total: int | None = None
