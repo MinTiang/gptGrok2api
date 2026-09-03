@@ -6,9 +6,19 @@
           <StateBadge :tone="registerConfig?.enabled ? 'success' : 'muted'" shape="rounded" size="sm">
             {{ registerConfig?.enabled ? '运行中' : '未启动' }}
           </StateBadge>
-          <MetaChip v-if="registerConfig" size="sm" :tone="autosaveTone" :title="autosaveMessage">
-            {{ autosaveLabel }}
+          <MetaChip v-if="registerConfig" size="sm" :tone="saveTone" :title="saveMessage">
+            {{ saveLabel }}
           </MetaChip>
+          <Button
+            v-if="registerConfig"
+            size="sm"
+            variant="primary"
+            :disabled="legacySaving || !hasUnsavedRegisterChanges"
+            @click="saveRegisterConfig"
+          >
+            <Icon icon="lucide:save" class="h-3.5 w-3.5" />
+            {{ legacySaving ? '保存中...' : '保存配置' }}
+          </Button>
         </template>
       </PanelHeader>
 
@@ -210,8 +220,8 @@ const registerConfigRuntime = useRegisterConfigRuntime({
 })
 const legacyLoading = registerConfigRuntime.loading
 const legacySaving = registerConfigRuntime.saving
-const autosaveStatus = registerConfigRuntime.autosaveStatus
-const autosaveMessage = registerConfigRuntime.autosaveMessage
+const saveStatus = registerConfigRuntime.saveStatus
+const saveMessage = registerConfigRuntime.saveMessage
 const registerConfig = registerConfigRuntime.config
 const registerProviders = registerConfigRuntime.providers
 const registerProxyMode = registerConfigRuntime.proxyMode
@@ -224,6 +234,7 @@ const applyRegisterRuntimeConfig = registerConfigRuntime.applyRuntimeConfig
 const loadRegisterConfig = registerConfigRuntime.loadConfig
 const loadRegisterRuntimeConfig = registerConfigRuntime.loadRuntimeConfig
 const loadProxyGroups = registerConfigRuntime.loadProxyGroups
+const saveRegisterConfig = registerConfigRuntime.saveConfig
 const toggleLegacyTask = registerConfigRuntime.toggleTask
 const resetLegacyStats = registerConfigRuntime.resetStats
 const setRegisterTarget = registerConfigRuntime.setTarget
@@ -293,15 +304,16 @@ const visibleRegisterProviderEntries = computed(() => registerProviders.value
 const enabledProviderIssueCount = computed(() => buildRegisterProviderIssueCount(registerProviders.value))
 const grokConfigIssueCount = computed(() => grokRequirementMessages(registerConfig.value).length)
 const sub2apiSyncIssueCount = computed(() => sub2apiSyncRequirementMessages(registerConfig.value).length)
-const autosaveLabel = computed(() => {
-  if (autosaveStatus.value === 'saving') return '自动保存中...'
-  if (autosaveStatus.value === 'pending') return '待保存'
-  if (autosaveStatus.value === 'error') return '自动保存失败'
-  return '已自动保存'
+const hasUnsavedRegisterChanges = registerConfigRuntime.hasUnsavedChanges
+const saveLabel = computed(() => {
+  if (saveStatus.value === 'saving') return '保存中...'
+  if (saveStatus.value === 'error') return '保存失败'
+  if (hasUnsavedRegisterChanges.value) return '有未保存修改'
+  return '已保存'
 })
-const autosaveTone = computed(() => {
-  if (autosaveStatus.value === 'error') return 'danger'
-  if (autosaveStatus.value === 'saving' || autosaveStatus.value === 'pending') return 'info'
+const saveTone = computed(() => {
+  if (saveStatus.value === 'error' || hasUnsavedRegisterChanges.value) return 'danger'
+  if (saveStatus.value === 'saving') return 'info'
   return 'success'
 })
 const registerIssueCount = computed(() => (

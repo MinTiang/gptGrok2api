@@ -1,4 +1,4 @@
-import { computed, ref, watch } from 'vue'
+import { computed, ref } from 'vue'
 import { getAuthToken } from '@/api/client'
 import { proxyApi, type ProxyGroup } from '@/api/proxy'
 import { registerApi, type LegacyRegisterConfig } from '@/api/register'
@@ -34,7 +34,6 @@ export type RegisterConfigRuntimeInput = {
 
 const REGISTER_CONFIG_REQUEST_KEY = 'register:config'
 const PROXY_GROUPS_REQUEST_KEY = 'register:proxy-groups'
-const AUTOSAVE_DELAY_MS = 800
 const PROVIDER_RUNTIME_KEYS = [
   'mailboxes_count',
   'mailboxes_base_count',
@@ -48,15 +47,14 @@ const PROVIDER_RUNTIME_KEYS = [
 export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
   const loading = ref(false)
   const saving = ref(false)
-  const autosaveStatus = ref<'idle' | 'pending' | 'saving' | 'saved' | 'error'>('idle')
-  const autosaveMessage = ref('')
+  const saveStatus = ref<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const saveMessage = ref('')
   const proxyGroups = ref<ProxyGroup[]>([])
   const proxyMode = ref<RegisterProxyMode>('global')
   const selectedProxyGroupId = ref('')
   const customProxyInput = ref('')
   const config = ref<LegacyRegisterConfig | null>(null)
   let savedConfigSnapshot = ''
-  let autosaveTimer: ReturnType<typeof setTimeout> | undefined
   let savePromise: Promise<boolean> | null = null
   const applyListeners = new Set<() => void>()
 
@@ -97,8 +95,8 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
   function applyConfig(nextConfig: LegacyRegisterConfig) {
     config.value = normalizeRegisterConfig(nextConfig)
     savedConfigSnapshot = configSnapshot(config.value)
-    autosaveStatus.value = 'saved'
-    autosaveMessage.value = '配置已保存'
+    saveStatus.value = 'saved'
+    saveMessage.value = '配置已保存'
     syncProxyControlsFromValue(config.value.proxy)
     applyListeners.forEach((callback) => callback())
   }
@@ -176,32 +174,14 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
     })
   }
 
-  function clearAutosaveTimer() {
-    if (autosaveTimer === undefined) return
-    clearTimeout(autosaveTimer)
-    autosaveTimer = undefined
-  }
-
-  function scheduleAutosave() {
-    clearAutosaveTimer()
-    if (!config.value || !savedConfigSnapshot || !hasUnsavedChanges.value) return
-    autosaveStatus.value = 'pending'
-    autosaveMessage.value = '等待自动保存...'
-    autosaveTimer = setTimeout(() => {
-      autosaveTimer = undefined
-      void persistConfig()
-    }, AUTOSAVE_DELAY_MS)
-  }
-
   async function persistConfig(notify = false): Promise<boolean> {
-    clearAutosaveTimer()
     if (!config.value || !hasUnsavedChanges.value) return true
     if (savePromise) return savePromise
 
     const requestSnapshot = configSnapshot(config.value)
     saving.value = true
-    autosaveStatus.value = 'saving'
-    autosaveMessage.value = '正在自动保存...'
+    saveStatus.value = 'saving'
+    saveMessage.value = '正在保存配置...'
     savePromise = (async () => {
       try {
         const response = await registerApi.updateConfig(payload())
@@ -210,41 +190,26 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
           applyConfig(normalizedResponse)
         } else {
           // Keep edits made while the request was in flight and use the
-          // server response as the new baseline for the next autosave.
+          // server response as the new baseline for the next manual save.
           savedConfigSnapshot = configSnapshot(normalizedResponse)
-          autosaveStatus.value = 'saved'
-          autosaveMessage.value = '已保存，正在同步最新修改...'
+          saveStatus.value = 'saved'
+          saveMessage.value = '已保存，仍有修改未保存'
         }
-        if (notify) input.notifySuccess('注册配置已自动保存')
+        if (notify) input.notifySuccess('注册配置已保存')
         return true
       } catch (error: any) {
-        const message = error?.message || '自动保存注册配置失败'
-        autosaveStatus.value = 'error'
-        autosaveMessage.value = message
+        const message = error?.message || '保存注册配置失败'
+        saveStatus.value = 'error'
+        saveMessage.value = message
         if (notify) input.notifyError(message)
         return false
       } finally {
         saving.value = false
         savePromise = null
-        if (autosaveStatus.value !== 'error' && hasUnsavedChanges.value) scheduleAutosave()
       }
     })()
     return savePromise
   }
-
-  async function flushAutosave(): Promise<boolean> {
-    clearAutosaveTimer()
-    if (savePromise) return savePromise
-    return persistConfig()
-  }
-
-  watch(
-    config,
-    () => {
-      if (config.value && savedConfigSnapshot && hasUnsavedChanges.value) scheduleAutosave()
-    },
-    { deep: true, flush: 'post' },
-  )
 
   async function loadConfig(silent = false) {
     await configQuery.run(
@@ -296,21 +261,18 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
   async function toggleTask() {
     if (!config.value) return
     const starting = !config.value.enabled
+    if (starting && hasUnsavedChanges.value) {
+      input.notifyError('存在未保存配置，请先点击“保存配置”')
+      return
+    }
     const ok = await input.confirm({
       title: starting ? '启动注册任务' : '停止注册任务',
-      message: starting ? '将保存当前配置并启动注册任务。' : '将停止当前注册任务。',
+      message: starting ? '将启动注册任务。' : '将停止当前注册任务。',
       confirmText: starting ? '启动' : '停止',
     })
     if (!ok) return
     saving.value = true
     try {
-      if (starting) {
-        const saved = await flushAutosave()
-        if (!saved) {
-          input.notifyError('配置自动保存失败，暂未启动注册任务')
-          return
-        }
-      }
       const response = starting ? await registerApi.startLegacy() : await registerApi.stopLegacy()
       applyConfig(response.register)
       if (starting && !response.register?.enabled) {
@@ -358,8 +320,8 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
     authToken: getAuthToken,
     loading,
     saving,
-    autosaveStatus,
-    autosaveMessage,
+    saveStatus,
+    saveMessage,
     proxyGroups,
     proxyMode,
     selectedProxyGroupId,
@@ -382,7 +344,6 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
     loadRuntimeConfig,
     loadProxyGroups,
     saveConfig,
-    flushAutosave,
     toggleTask,
     resetStats,
     invalidate,

@@ -1140,7 +1140,7 @@ export function registerRuntimeHint(
   if (enabledCount === 0) return '至少启用一个邮箱来源。'
   if (issueCount > 0) return `还有 ${issueCount} 项必填配置未完成。`
   if (config?.enabled) return '任务运行中，配置已锁定。'
-  return '启动前会自动保存当前配置。'
+  return '启动前请先保存当前配置。'
 }
 
 export function registerRuntimeLogLines(

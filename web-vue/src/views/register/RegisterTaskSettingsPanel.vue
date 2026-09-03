@@ -987,7 +987,7 @@ function checkoutProxyTestText(stage: CheckoutProxyTestStage) {
     ? `抽样第 ${result.sample_index}/${result.sample_count} 条`
     : '抽样代理'
   if (result.ok) {
-    const saved = result.normalized_changed ? '；已补全协议并自动保存，当前队列下一轮生效。' : '；协议已确认。'
+    const saved = result.normalized_changed ? '；已补全协议，请点击“保存配置”后生效。' : '；协议已确认。'
     return `${sample}可用：${result.scheme.toUpperCase()}，HTTP ${result.status}，${result.latency_ms} ms${saved}`
   }
   return `${sample}不可用：${result.error || '代理测试失败'}`
