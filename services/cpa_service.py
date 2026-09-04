@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 
+from curl_cffi import CurlMime
 from curl_cffi.requests import Session
 
 from services.account_service import account_service
@@ -285,17 +286,18 @@ def _upload_auth_file(pool: dict, file_name: str, payload: dict, provider_label:
         raise CPAUploadError("CPA 连接不完整，请重新保存连接")
 
     session = Session(**proxy_settings.build_session_kwargs(verify=True))
+    mime = CurlMime()
     try:
+        mime.addpart(
+            "file",
+            filename=file_name,
+            content_type="application/json",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        )
         response = session.post(
             f"{base_url.rstrip('/')}/v0/management/auth-files",
             headers=_management_headers(secret_key),
-            files={
-                "file": (
-                    file_name,
-                    json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                    "application/json",
-                )
-            },
+            multipart=mime,
             timeout=30,
         )
         if not response.ok:
@@ -311,6 +313,10 @@ def _upload_auth_file(pool: dict, file_name: str, payload: dict, provider_label:
             f"CPA 上传 {provider_label} OAuth 文件请求失败{suffix}"
         ) from exc
     finally:
+        try:
+            mime.close()
+        except Exception:
+            pass
         session.close()
 
     return {
