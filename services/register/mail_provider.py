@@ -1018,6 +1018,9 @@ class BaseMailProvider:
     def wait_for(self, mailbox: dict[str, Any], on_message: Callable[[dict[str, Any]], ResultT | None]) -> ResultT | None:
         stop_event = mailbox.get("_stop_event")
         deadline = time.monotonic() + self.conf["wait_timeout"]
+        # Honor provider-supplied mailbox TTL so we don't waste threads polling
+        # a mailbox that will be deleted before a code can arrive.
+        deadline = _cap_deadline_by_expiry(deadline, mailbox)
         consecutive_transient = 0
         while time.monotonic() < deadline:
             if stop_event is not None and stop_event.is_set():
@@ -1280,6 +1283,69 @@ def _is_terminal_mailbox_fetch_error(error: Exception) -> bool:
         if re.search(marker, text):
             return True
     return False
+
+
+def _cap_deadline_by_expiry(deadline: float, mailbox: dict[str, Any]) -> float:
+    """Shrink the polling deadline so it ends before the mailbox is deleted.
+
+    Many disposable-email providers (LuckyGmail, GPTMail, ...) return an
+    ``expires_at`` field in their ``create_mailbox`` response.  If we
+    blindly poll until ``wait_timeout`` we can easily waste 10-20 minutes
+    on a mailbox that was actually deleted long ago.  This helper caps
+    the deadline to ``expires_at - safety_margin`` so we give up and move
+    to the next account instead.
+    """
+    expires_at = mailbox.get("expires_at")
+    if not expires_at:
+        return deadline
+    expiry_monotonic = _parse_expires_at_monotonic(expires_at)
+    if expiry_monotonic is None:
+        # Couldn't parse, or already expired — bail fast.
+        return time.monotonic() + 1.0
+    safety_margin = 30.0  # seconds before actual expiry
+    capped = expiry_monotonic - safety_margin
+    if capped <= time.monotonic():
+        # Already expired or about to expire — bail fast.
+        return time.monotonic() + 1.0
+    return min(deadline, capped)
+
+
+def _parse_expires_at_monotonic(value: Any) -> float | None:
+    """Convert an ``expires_at`` timestamp from a provider response into a
+    ``time.monotonic()``-anchored seconds-since-boot value.
+
+    Returns ``None`` if the value can't be parsed or is clearly invalid.
+    """
+    if value is None:
+        return None
+    now = time.time()
+    # Common shapes: Unix epoch in seconds, milliseconds, or ISO-8601 string.
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        # Heuristic: > 10^12 → milliseconds; > 10^9 → seconds (unix epoch).
+        if numeric > 1e12:
+            numeric = numeric / 1000.0
+        if numeric < 1e9:
+            # Probably already a monotonic seconds value — treat as-is.
+            return time.monotonic() + max(0.0, numeric)
+        offset = numeric - now
+        if offset <= 0:
+            return None  # already expired
+        return time.monotonic() + offset
+    text = str(value).strip()
+    if not text:
+        return None
+    # Try ISO 8601 / RFC 3339.
+    try:
+        import datetime as _dt
+        parsed = _dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        offset = parsed.timestamp() - now
+        if offset <= 0:
+            return None
+        return time.monotonic() + offset
+    except Exception:
+        pass
+    return None
 
 
 class DDGMailProvider(BaseMailProvider):
@@ -2187,6 +2253,7 @@ class ICloudPrivacyMailProvider(BaseMailProvider):
 
     def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
         deadline = time.monotonic() + self.conf["wait_timeout"]
+        deadline = _cap_deadline_by_expiry(deadline, mailbox)
         while time.monotonic() < deadline:
             remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
             mailbox["_icloud_request_wait_ms"] = min(self.wait_ms, remaining_ms)
@@ -3035,6 +3102,7 @@ class OutlookTokenProvider(BaseMailProvider):
         seen_refs = {str(item) for item in seen_value}
 
         deadline = time.monotonic() + self.conf["wait_timeout"]
+        deadline = _cap_deadline_by_expiry(deadline, mailbox)
         stop_event = mailbox.get("_stop_event")
         target_address = str(mailbox.get("address") or "").strip()
         last_transient_error: Exception | None = None
