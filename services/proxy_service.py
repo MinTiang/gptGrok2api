@@ -195,6 +195,18 @@ class ResolvedProxyReference:
     image_egress_wait_ms: int = 0
 
 
+def _debug_flaresolverr(*, target_host: str, proxy_url: str, cookie_keys: list[str], user_agent: str) -> None:
+    """Print one concise FlareSolverr clearance summary to the running console."""
+    has_cf = "cf_clearance" in cookie_keys
+    ua_short = (user_agent or "")[:80]
+    safe_proxy = (proxy_url or "direct").replace("@", "***@")
+    print(
+        f"[FlareSolverr] host={target_host} proxy={safe_proxy} "
+        f"cookies={cookie_keys} cf_clearance={'YES' if has_cf else 'NO'} "
+        f"ua={ua_short}"
+    )
+
+
 class FlareSolverrClearanceProvider:
     def __init__(self, flaresolverr_url: str, request_method: FlareSolverrRequestMethod | None = None) -> None:
         self.flaresolverr_url = str(flaresolverr_url or "").strip().rstrip("/")
@@ -236,6 +248,12 @@ class FlareSolverrClearanceProvider:
         target_host = _host_from_url(target_url)
         cookies = _filter_flaresolverr_cookies(solution.get("cookies"), target_host)
         user_agent = str(solution.get("userAgent") or "").strip()
+        _debug_flaresolverr(
+            target_host=target_host,
+            proxy_url=proxy_url,
+            cookie_keys=sorted(cookies.keys()) if isinstance(cookies, dict) else [],
+            user_agent=user_agent,
+        )
         if not cookies and not user_agent:
             return None
         return ClearanceBundle(

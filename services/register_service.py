@@ -519,9 +519,19 @@ def _outlook_mailbox_id(provider_id: str, email: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()[:24]
 
 
+def _safe_json_default(obj: object) -> str:
+    """Fallback for any non-JSON-serializable object that leaks into a
+    registration snapshot (e.g. a threading.Event or Condition)."""
+    return f"<{type(obj).__name__}>"
+
+
 def _default_config() -> dict:
+    backend_config = {
+        k: v for k, v in openai_register.config.items()
+        if not str(k).startswith("_")
+    }
     return {
-        **openai_register.config,
+        **backend_config,
         "target": "openai",
         "grok": dict(DEFAULT_GROK_CONFIG),
         "mode": "total",
@@ -749,11 +759,19 @@ class RegisterService:
         return _normalize(read_json_object(self._store_file, name="register.json"))
 
     def _save(self) -> None:
-        write_json_file(self._store_file, self._config)
+        safe_config = {
+            k: v for k, v in self._config.items()
+            if not str(k).startswith("_")
+        }
+        write_json_file(self._store_file, safe_config)
 
     def _runtime_config(self, target: str | None = None) -> dict:
         selected_target = str(target or self._config.get("target") or "openai").strip().lower()
-        runtime = json.loads(json.dumps(self._config, ensure_ascii=False))
+        clean_config = {
+            k: v for k, v in self._config.items()
+            if not str(k).startswith("_")
+        }
+        runtime = json.loads(json.dumps(clean_config, ensure_ascii=False, default=_safe_json_default))
         runtime["target"] = selected_target if selected_target in REGISTER_TARGETS else "openai"
         grok = runtime.get("grok") if isinstance(runtime.get("grok"), dict) else {}
         grok["max_mail_retry"] = int(grok.get("max_mail_retries") or 3)
@@ -825,10 +843,14 @@ class RegisterService:
                 for job in self._checkout_retry_jobs.values()
                 if job.get("stop_event") is self._checkout_retry_stop_event
             )
+            public_config = {
+                k: v for k, v in self._config.items()
+                if not str(k).startswith("_")
+            }
             snapshot = json.loads(
                 json.dumps(
                     {
-                        **self._config,
+                        **public_config,
                         "logs": self._logs[-300:],
                         "grok_oauth_logs": self._grok_oauth_logs[-300:],
                         "checkout_logs": self._checkout_logs[-300:],
@@ -839,6 +861,7 @@ class RegisterService:
                         "checkout_retry_job_count": active_checkout_jobs,
                     },
                     ensure_ascii=False,
+                    default=_safe_json_default,
                 )
             )
         self._redact_outlook_pools(snapshot)

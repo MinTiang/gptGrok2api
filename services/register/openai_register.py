@@ -944,6 +944,22 @@ def _apply_clearance_to_session(session: requests.Session, bundle: ClearanceBund
             continue
 
 
+def _debug_session_cookies(session: requests.Session, *, label: str = "") -> None:
+    """Print the cookie jar contents for the current session (names only, no values)."""
+    try:
+        jar = getattr(session, "cookies", None)
+        if jar is None:
+            print(f"[Debug] {label}: no cookie jar on session")
+            return
+        cookies = list(jar)
+        names = sorted(set(getattr(c, "name", str(c)) for c in cookies))
+        has_cf = any(n == "cf_clearance" for n in names)
+        domains = sorted(set(getattr(c, "domain", "") for c in cookies))
+        print(f"[Debug] {label}: cookie_names={names} cf_clearance={'YES' if has_cf else 'NO'} domains={domains}")
+    except Exception as exc:
+        print(f"[Debug] {label}: cookie introspect failed {type(exc).__name__}: {exc}")
+
+
 def _headers_with_clearance(
     headers: dict[str, str],
     target_url: str,
@@ -1420,6 +1436,7 @@ class PlatformRegistrar:
             if bundle is None:
                 raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
             retry_headers = _headers_with_clearance(self._navigate_headers(f"{platform_base}/"), target_url, self.proxy, self.clearance_user_agent)
+            _debug_session_cookies(self.session, label="platform_authorize 重试前")
             resp, error = request_with_local_retry(self.session, "get", target_url, headers=retry_headers, allow_redirects=True, verify=False)
             if _is_cloudflare_challenge(resp):
                 raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
