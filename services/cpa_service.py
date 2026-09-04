@@ -303,7 +303,13 @@ def _upload_auth_file(pool: dict, file_name: str, payload: dict, provider_label:
     except CPAUploadError:
         raise
     except Exception as exc:
-        raise CPAUploadError(f"CPA 上传 {provider_label} OAuth 文件请求失败") from exc
+        brief = str(exc).strip().replace("\n", " ")[:200]
+        suffix = f"（{type(exc).__name__}"
+        suffix += f": {brief}" if brief else ""
+        suffix += "）"
+        raise CPAUploadError(
+            f"CPA 上传 {provider_label} OAuth 文件请求失败{suffix}"
+        ) from exc
     finally:
         session.close()
 
