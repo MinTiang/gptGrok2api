@@ -1018,10 +1018,33 @@ class BaseMailProvider:
     def wait_for(self, mailbox: dict[str, Any], on_message: Callable[[dict[str, Any]], ResultT | None]) -> ResultT | None:
         stop_event = mailbox.get("_stop_event")
         deadline = time.monotonic() + self.conf["wait_timeout"]
+        consecutive_transient = 0
         while time.monotonic() < deadline:
             if stop_event is not None and stop_event.is_set():
                 return None
-            message = self.fetch_latest_message(mailbox)
+            try:
+                message = self.fetch_latest_message(mailbox)
+            except Exception as exc:
+                # Terminal mailbox lifecycle errors: fail fast so the
+                # registration thread can move on to the next account.
+                if _is_terminal_mailbox_fetch_error(exc):
+                    raise
+                # Transient failures (network, rate limit, etc.): retry
+                # within the deadline, but give up early on a long streak.
+                consecutive_transient += 1
+                if consecutive_transient >= 8:
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                interval = max(0.5, min(float(self.conf["wait_interval"] or 2), remaining))
+                if stop_event is not None:
+                    if stop_event.wait(interval):
+                        return None
+                else:
+                    time.sleep(interval)
+                continue
+            consecutive_transient = 0
             if stop_event is not None and stop_event.is_set():
                 return None
             if message:
@@ -1227,6 +1250,36 @@ class CloudflareTempMailProvider(BaseMailProvider):
 
     def close(self) -> None:
         self.session.close()
+
+
+def _is_terminal_mailbox_fetch_error(error: Exception) -> bool:
+    """True when a mailbox fetch error cannot recover by retrying.
+
+    These are lifecycle / configuration errors such as:
+    - The mailbox was deleted / expired on the provider side
+    - The address/token is invalid or unknown to the provider
+    - Auth / credential problems that won't heal mid-run
+
+    Transient errors (network, timeout, rate-limit HTTP 429, HTTP 5xx) should
+    return False so that ``BaseMailProvider.wait_for`` keeps polling.
+    """
+    text = str(error or "").lower()
+    terminal_markers = (
+        "邮箱已被删除",
+        "邮箱地址不存在",
+        "mailbox.*deleted",
+        "mailbox.*does not exist",
+        "mailbox.*not found",
+        "mailbox.*expired",
+        "address.*not found",
+        "address.*does not exist",
+        "invalid token",
+        "unknown address",
+    )
+    for marker in terminal_markers:
+        if re.search(marker, text):
+            return True
+    return False
 
 
 class DDGMailProvider(BaseMailProvider):

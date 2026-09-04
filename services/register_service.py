@@ -4173,6 +4173,27 @@ class RegisterService:
             target_available=target_available,
         )
 
+    @staticmethod
+    def _wait_for_futures_or_stop(
+        futures: set,
+        stop_event: threading.Event | None = None,
+        poll_interval: float = 1.0,
+    ) -> tuple[set, set]:
+        """Wait until at least one future completes OR stop_event fires.
+
+        Returns ``(finished_futures, still_pending_futures)``.  The returned
+        ``finished`` set is always non-empty when ``stop_event`` is not set;
+        when ``stop_event`` fires the caller should cancel remaining futures.
+        """
+        if not futures:
+            return set(), set()
+        while True:
+            finished, pending = wait(futures, timeout=poll_interval, return_when=FIRST_COMPLETED)
+            if finished:
+                return finished, pending
+            if stop_event is not None and stop_event.is_set():
+                return set(), pending
+
     def _target_reached(self, cfg: dict, submitted: int) -> bool:
         mode = str(cfg.get("mode") or "total")
         if str(cfg.get("target") or "openai") == "grok":
@@ -4223,6 +4244,7 @@ class RegisterService:
         stop_event = stop_event or self._register_stop_event
         threads = max(1, int(options.get("threads") or self.get()["threads"]))
         submitted, done, success, fail = 0, 0, 0, 0
+        _last_futures_cleanup = 0.0
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
             while True:
@@ -4240,12 +4262,20 @@ class RegisterService:
                     submitted += 1
                     futures.add(executor.submit(backend.worker, submitted))
                 self._bump(running=len(futures), done=done, success=success, fail=fail)
-                if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
+                if not futures and (not self.get()["enabled"] or stop_event.is_set() or str(cfg.get("mode") or "total") == "total"):
                     break
                 if not futures:
                     time.sleep(max(1, int(cfg.get("check_interval") or 5)))
                     continue
-                finished, futures = wait(futures, return_when=FIRST_COMPLETED)
+                # Listen on both futures and stop_event so the runner can
+                # break out immediately when the user requests a stop, even if
+                # workers are blocked in long I/O.
+                finished, futures = self._wait_for_futures_or_stop(futures, stop_event)
+                # If stop_event fired, abandon remaining futures without waiting.
+                if stop_event.is_set():
+                    for fut in list(futures):
+                        fut.cancel()
+                    break
                 for future in finished:
                     done += 1
                     try:
@@ -4268,6 +4298,14 @@ class RegisterService:
                     except Exception as exc:
                         fail += 1
                         self._append_log(f"任务结果处理失败: {type(exc).__name__}: {exc}", "red")
+            # After breaking out of the loop, give workers a moment to bail
+            # cleanly (their wait_for loops already check stop_event).
+            self._append_log("正在等待剩余注册任务退出", "yellow")
+            # ``cancel_futures=True`` cancels queued-but-not-started work.
+            # Already-running workers are daemon-friendly; if they don't heed
+            # the stop_event quickly the runner still releases so a new
+            # registration can start.
+            executor.shutdown(wait=False, cancel_futures=True)
         self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
         with self._lock:
             if self._register_stop_event is stop_event:
