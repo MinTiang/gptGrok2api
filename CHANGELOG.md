@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.2 - 2026-09-17
+
++ [新增] 注册中心新增 `outlook_email` 邮箱 provider，对接自部署的 [outlookEmail](https://github.com/assast/outlookEmail) 实例：通过其对外 API（X-API-Key）领取未注册账号并轮询收件箱/垃圾箱取验证码，本地 SQLite 租约保证多线程/多进程不重复领取。
++ [新增] 注册成功后自动通过 outlookEmail Web Session 给账号打成功标签（默认 `gpt`，可配置），后续领取自动跳过已打标签账号；打标签失败仅记录日志，不影响注册结果。
++ [新增] provider 支持按 outlookEmail 分组 ID、标签 ID 过滤可领取范围，可选是否同时检查垃圾邮件文件夹、是否走注册代理；登录会话使用 permanent 有效期并支持过期自动重登。
+
 ## 1.2.1 - 2026-07-27
 
 + [新增] Grok OAuth 定时巡查接入自动恢复队列；检测到 `xAI CLI OAuth account needs reauthorization` 时直接使用账号现有身份重新授权，并在恢复成功后继续模型探测与外部投递。
