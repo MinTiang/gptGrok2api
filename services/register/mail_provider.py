@@ -1017,52 +1017,77 @@ class BaseMailProvider:
 
     def wait_for(self, mailbox: dict[str, Any], on_message: Callable[[dict[str, Any]], ResultT | None]) -> ResultT | None:
         stop_event = mailbox.get("_stop_event")
-        deadline = time.monotonic() + self.conf["wait_timeout"]
+        wait_started = time.monotonic()
+        configured_timeout = float(self.conf["wait_timeout"] or 0)
+        deadline = wait_started + configured_timeout
         # Honor provider-supplied mailbox TTL so we don't waste threads polling
         # a mailbox that will be deleted before a code can arrive.
         deadline = _cap_deadline_by_expiry(deadline, mailbox)
+        # 期限被邮箱过期时间截断时如实记录，方便从日志区分"没等到"和"没去等"。
+        capped_by_expiry = deadline < wait_started + configured_timeout - 0.5
+        polls = 0
+        fetch_errors = 0
+
+        def _record_wait_summary(outcome: str) -> None:
+            mailbox["_last_wait_summary"] = (
+                f"轮询{polls}次/失败{fetch_errors}次, 等待{int(time.monotonic() - wait_started)}s, "
+                f"结束原因={outcome}({ '邮箱过期截断' if capped_by_expiry else '等待超时上限' })"
+            )
+
         consecutive_transient = 0
-        while time.monotonic() < deadline:
-            if stop_event is not None and stop_event.is_set():
-                return None
-            try:
-                message = self.fetch_latest_message(mailbox)
-            except Exception as exc:
-                # Terminal mailbox lifecycle errors: fail fast so the
-                # registration thread can move on to the next account.
-                if _is_terminal_mailbox_fetch_error(exc):
-                    raise
-                # Transient failures (network, rate limit, etc.): retry
-                # within the deadline, but give up early on a long streak.
-                # 阈值要低：单次失败内部可能已重试 3 次并吃满 3×request_timeout，
-                # 高阈值会让死掉的服务拖住注册线程远超 wait_timeout。
-                consecutive_transient += 1
-                if consecutive_transient >= 3:
-                    raise
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                interval = max(0.5, min(float(self.conf["wait_interval"] or 2), remaining))
+        try:
+            while time.monotonic() < deadline:
+                if stop_event is not None and stop_event.is_set():
+                    _record_wait_summary("任务停止")
+                    return None
+                polls += 1
+                try:
+                    message = self.fetch_latest_message(mailbox)
+                except Exception as exc:
+                    # Terminal mailbox lifecycle errors: fail fast so the
+                    # registration thread can move on to the next account.
+                    if _is_terminal_mailbox_fetch_error(exc):
+                        raise
+                    # Transient failures (network, rate limit, etc.): retry
+                    # within the deadline, but give up early on a long streak.
+                    # 阈值要低：单次失败内部可能已重试 3 次并吃满 3×request_timeout，
+                    # 高阈值会让死掉的服务拖住注册线程远超 wait_timeout。
+                    fetch_errors += 1
+                    consecutive_transient += 1
+                    if consecutive_transient >= 3:
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    interval = max(0.5, min(float(self.conf["wait_interval"] or 2), remaining))
+                    if stop_event is not None:
+                        if stop_event.wait(interval):
+                            _record_wait_summary("任务停止")
+                            return None
+                    else:
+                        time.sleep(interval)
+                    continue
+                consecutive_transient = 0
+                if stop_event is not None and stop_event.is_set():
+                    _record_wait_summary("任务停止")
+                    return None
+                if message:
+                    result = on_message(message)
+                    if result is not None:
+                        _record_wait_summary("收到验证码")
+                        return result
+                interval = max(0.2, self.conf["wait_interval"])
                 if stop_event is not None:
                     if stop_event.wait(interval):
+                        _record_wait_summary("任务停止")
                         return None
                 else:
                     time.sleep(interval)
-                continue
-            consecutive_transient = 0
-            if stop_event is not None and stop_event.is_set():
-                return None
-            if message:
-                result = on_message(message)
-                if result is not None:
-                    return result
-            interval = max(0.2, self.conf["wait_interval"])
-            if stop_event is not None:
-                if stop_event.wait(interval):
-                    return None
-            else:
-                time.sleep(interval)
-        return None
+            _record_wait_summary("等待期限耗尽")
+            return None
+        except Exception:
+            _record_wait_summary("查询异常")
+            raise
 
     def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
         seen_value = mailbox.setdefault("_seen_code_message_refs", [])
@@ -1296,19 +1321,23 @@ def _cap_deadline_by_expiry(deadline: float, mailbox: dict[str, Any]) -> float:
     on a mailbox that was actually deleted long ago.  This helper caps
     the deadline to ``expires_at - safety_margin`` so we give up and move
     to the next account instead.
+
+    只有“确定可信”的过期时间才允许截断等待：解析失败或格式存疑时必须
+    保留完整 wait_timeout。此前解析失败会把期限砍到 1 秒，邮箱每个账号
+    实际只轮询一次就放弃（时区解释差异就能触发）。
     """
     expires_at = mailbox.get("expires_at")
     if not expires_at:
         return deadline
     expiry_monotonic = _parse_expires_at_monotonic(expires_at)
     if expiry_monotonic is None:
-        # Couldn't parse, or already expired — bail fast.
-        return time.monotonic() + 1.0
+        # 解析失败/格式存疑：不做截断，按完整 wait_timeout 轮询。
+        return deadline
     safety_margin = 30.0  # seconds before actual expiry
     capped = expiry_monotonic - safety_margin
     if capped <= time.monotonic():
-        # Already expired or about to expire — bail fast.
-        return time.monotonic() + 1.0
+        # 上游明确表示已过期：快速放弃（这不是解析歧义，是可信信号）。
+        return time.monotonic() + 2.0
     return min(deadline, capped)
 
 
@@ -1328,7 +1357,10 @@ def _parse_expires_at_monotonic(value: Any) -> float | None:
         if numeric > 1e12:
             numeric = numeric / 1000.0
         if numeric < 1e9:
-            # Probably already a monotonic seconds value — treat as-is.
+            # Probably a TTL in seconds. 可信度太低的极小值按解析失败处理，
+            # 避免生成 1-2 秒的截断期限让邮箱只被轮询一次。
+            if numeric < 10.0:
+                return None
             return time.monotonic() + max(0.0, numeric)
         offset = numeric - now
         if offset <= 0:
@@ -1825,14 +1857,16 @@ class LuckyGmailProvider(BaseMailProvider):
         })
 
     def _throttle(self) -> None:
-        now = time.monotonic()
+        # 原子预约下一个请求时间槽，锁外等待。此前在持锁状态下 sleep，
+        # 多线程共用同一 api_base 时会互相串行排队，把 2s 的建议间隔
+        # 放大成每线程十几秒一次的轮询。
         with luckygmail_rate_lock:
-            last = luckygmail_last_request_at.get(self.api_base, 0.0)
-            delay = self.request_interval - (now - last)
-            if delay > 0:
-                time.sleep(delay)
-                now = time.monotonic()
-            luckygmail_last_request_at[self.api_base] = now
+            now = time.monotonic()
+            start = max(now, luckygmail_last_request_at.get(self.api_base, 0.0))
+            luckygmail_last_request_at[self.api_base] = start + self.request_interval
+        delay = start - now
+        if delay > 0:
+            time.sleep(delay)
 
     def _request(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         if not self.api_base:

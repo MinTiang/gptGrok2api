@@ -846,6 +846,7 @@ def _wait_for_chatgpt_registration_code(
     if code:
         return code
 
+    wait_summary = str(mailbox.get("_last_wait_summary") or "").strip()
     if is_cf_mail and resend is not None:
         step(index, "CF 邮箱首次未收到验证码，正在重发一次", "yellow")
         resend()
@@ -858,7 +859,10 @@ def _wait_for_chatgpt_registration_code(
         if code:
             return code
 
-    raise OpenAIMailboxDeliveryTimeout(mailbox, "验证码投递超时：邮箱服务未返回新邮件")
+    raise OpenAIMailboxDeliveryTimeout(
+        mailbox,
+        "验证码投递超时：邮箱服务未返回新邮件" + (f"（{wait_summary}）" if wait_summary else ""),
+    )
 
 
 from utils.sentinel import (

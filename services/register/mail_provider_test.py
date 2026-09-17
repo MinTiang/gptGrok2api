@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import unittest
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -1353,6 +1354,112 @@ class CreateMailboxRotationTest(unittest.TestCase):
         self.assertIn("a 池已用尽", str(raised.exception))
         # 冷却期内不再构造任何 provider。
         self.assertEqual(factory.call_count, 2)
+
+
+class MailboxExpiryCapTest(unittest.TestCase):
+    def test_unparseable_expires_at_keeps_full_deadline(self) -> None:
+        deadline = 12345.0
+        for value in ("not-a-timestamp", "", "1800-01-01T00:00:00", 5, 0, None):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    mail_provider._cap_deadline_by_expiry(deadline, {"expires_at": value}),
+                    deadline,
+                    "解析失败或存疑时不得截断等待期限",
+                )
+
+    def test_confirmed_expired_mailbox_bails_quickly(self) -> None:
+        expired = time.time() - 120
+        result = mail_provider._cap_deadline_by_expiry(12345.0, {"expires_at": expired})
+        self.assertLessEqual(result, time.monotonic() + 3.0)
+
+    def test_future_expiry_caps_deadline_with_safety_margin(self) -> None:
+        future = time.time() + 120
+        far_deadline = time.monotonic() + 10000.0
+        result = mail_provider._cap_deadline_by_expiry(far_deadline, {"expires_at": future})
+        expected = time.monotonic() + 120 - 30
+        self.assertAlmostEqual(result, expected, delta=1.0)
+
+
+class WaitSummaryTest(unittest.TestCase):
+    class _CountingProvider(mail_provider.BaseMailProvider):
+        name = "counting"
+
+        def __init__(self, conf, results):
+            super().__init__(conf, "counting#1")
+            self.results = list(results)
+
+        def fetch_latest_message(self, mailbox):
+            if self.results:
+                return self.results.pop(0)
+            return None
+
+    def test_wait_summary_recorded_on_deadline(self) -> None:
+        provider = self._CountingProvider(
+            {"wait_timeout": 0.4, "wait_interval": 0.05, "request_timeout": 1, "user_agent": "t", "proxy": ""},
+            [],
+        )
+        mailbox = {"address": "x@example.test"}
+        code = provider.wait_for_code(mailbox)
+        self.assertIsNone(code)
+        summary = str(mailbox.get("_last_wait_summary") or "")
+        self.assertIn("轮询", summary)
+        self.assertIn("等待期限耗尽", summary)
+
+    def test_wait_summary_recorded_on_code(self) -> None:
+        message = {"subject": "code", "message_id": "m1", "text_content": "code is 123456"}
+        provider = self._CountingProvider(
+            {"wait_timeout": 2, "wait_interval": 0.05, "request_timeout": 1, "user_agent": "t", "proxy": ""},
+            [message],
+        )
+        mailbox = {"address": "x@example.test"}
+        code = provider.wait_for_code(mailbox)
+        self.assertEqual(code, "123456")
+        self.assertIn("收到验证码", str(mailbox.get("_last_wait_summary")))
+
+
+class LuckyGmailThrottleTest(unittest.TestCase):
+    def setUp(self) -> None:
+        mail_provider.luckygmail_last_request_at.clear()
+
+    def tearDown(self) -> None:
+        mail_provider.luckygmail_last_request_at.clear()
+
+    def _provider(self) -> mail_provider.LuckyGmailProvider:
+        with patch.object(mail_provider, "_create_session", return_value=MagicMock()):
+            return mail_provider.LuckyGmailProvider(
+                {"type": "luckygmail", "provider_ref": "luckygmail:t", "api_base": "https://lg.test", "api_key": "k"},
+                {"request_timeout": 1, "wait_timeout": 1, "wait_interval": 0.1, "user_agent": "t", "proxy": ""},
+            )
+
+    def test_throttle_sleeps_outside_the_global_lock(self) -> None:
+        provider = self._provider()
+        # 预约一个未来时间槽，强制 _throttle 进入等待分支。
+        mail_provider.luckygmail_last_request_at[provider.api_base] = time.monotonic() + 0.5
+        lock_held_during_sleep = []
+        real_lock = mail_provider.luckygmail_rate_lock
+
+        def fake_sleep(seconds):
+            acquired = real_lock.acquire(blocking=False)
+            lock_held_during_sleep.append(acquired)
+            if acquired:
+                real_lock.release()
+
+        with patch.object(mail_provider.time, "sleep", side_effect=fake_sleep):
+            provider._throttle()
+
+        self.assertTrue(lock_held_during_sleep and all(lock_held_during_sleep), "sleep 期间不得持有全局限流锁")
+
+    def test_throttle_books_slots_atomically(self) -> None:
+        provider = self._provider()
+        with patch.object(mail_provider.time, "sleep") as sleep:
+            provider._throttle()
+            first_gap = sleep.call_args.args[0] if sleep.call_args else 0.0
+            provider._throttle()
+            second_gap = sleep.call_args.args[0] if sleep.call_args else 0.0
+
+        # 第一次立即放行（无历史），第二次应等待一个完整间隔。
+        self.assertLessEqual(first_gap, 0.05)
+        self.assertGreaterEqual(second_gap, mail_provider.LuckyGmailProvider.min_request_interval - 0.2)
 
 
 if __name__ == "__main__":
