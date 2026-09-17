@@ -1034,8 +1034,10 @@ class BaseMailProvider:
                     raise
                 # Transient failures (network, rate limit, etc.): retry
                 # within the deadline, but give up early on a long streak.
+                # 阈值要低：单次失败内部可能已重试 3 次并吃满 3×request_timeout，
+                # 高阈值会让死掉的服务拖住注册线程远超 wait_timeout。
                 consecutive_transient += 1
-                if consecutive_transient >= 8:
+                if consecutive_transient >= 3:
                     raise
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -3640,7 +3642,9 @@ class OutlookEmailProvider(BaseMailProvider):
                 if _is_terminal_mailbox_fetch_error(exc):
                     raise
                 consecutive_failures += 1
-                if consecutive_failures >= 8:
+                # 与 BaseMailProvider.wait_for 同理：单次失败可能已内部重试
+                # 多次，低阈值避免死服务拖住线程远超 wait_timeout。
+                if consecutive_failures >= 3:
                     raise
                 interval = max(0.5, min(float(self.conf["wait_interval"] or 2), max(0.0, deadline - time.monotonic())))
                 if interval <= 0:
@@ -3802,8 +3806,11 @@ def create_mailbox(
     if not enabled:
         raise RuntimeError("没有剩余可用的邮箱提供商")
     tried: set[str] = set()
-    last_error = ""
+    errors: list[str] = []
+    stop_event = mail_config.get("_stop_event")
     for _ in range(len(enabled)):
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("注册任务已停止，邮箱创建中止")
         provider = _create_provider(mail_config, excluded_provider_refs=excluded)
         provider_key = f"{provider.name}#{provider.provider_ref}"
         try:
@@ -3813,13 +3820,13 @@ def create_mailbox(
             mailbox = provider.create_mailbox(username)
             mailbox["_code_not_before"] = datetime.now(timezone.utc)
             return mailbox
-        except RuntimeError as error:
-            last_error = str(error)
-            if "DDG日上限已达" not in last_error:
-                raise
+        except Exception as error:
+            # 单个来源失败（池耗尽、接口故障等）轮换到下一个来源；全部
+            # 失败时汇总报错，避免一个坏来源卡死整批注册。
+            errors.append(f"[{provider.provider_ref or provider.name}] {str(error)[:200]}")
         finally:
             provider.close()
-    raise RuntimeError(last_error or "所有启用的邮箱提供商均无法创建邮箱")
+    raise RuntimeError("所有启用的邮箱提供商均无法创建邮箱：" + "；".join(errors[-3:]))
 
 
 def sync_icloud_claims(mail_config: dict, project: str, emails: list[str]) -> dict[str, Any]:
@@ -3965,7 +3972,7 @@ def get_existing_mailbox(mail_config: dict, email: str) -> dict:
     """通过管理员密码获取已有邮箱地址的 JWT，用于查询邮件。"""
     enabled = _enabled_entries(mail_config)
     tried: set[str] = set()
-    last_error = ""
+    errors: list[str] = []
     for _ in range(len(enabled)):
         provider = _create_provider(mail_config)
         provider_key = f"{provider.name}#{provider.provider_ref}"
@@ -3978,10 +3985,8 @@ def get_existing_mailbox(mail_config: dict, email: str) -> dict:
                 return mailbox
             else:
                 raise RuntimeError(f"邮箱提供商 {provider.name} 不支持查询已有邮箱")
-        except RuntimeError as error:
-            last_error = str(error)
-            if "DDG日上限已达" not in last_error:
-                raise
+        except Exception as error:
+            errors.append(f"[{provider.provider_ref or provider.name}] {str(error)[:200]}")
         finally:
             provider.close()
-    raise RuntimeError(last_error or "所有启用的邮箱提供商均无法查询已有邮箱")
+    raise RuntimeError("所有启用的邮箱提供商均无法查询已有邮箱：" + "；".join(errors[-3:]))

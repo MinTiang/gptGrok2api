@@ -1245,5 +1245,63 @@ class OutlookEmailProviderTest(unittest.TestCase):
             provider.close()
 
 
+class CreateMailboxRotationTest(unittest.TestCase):
+    @staticmethod
+    def _fake_provider(name: str, ref: str, *, mailbox=None, error=None) -> MagicMock:
+        provider = MagicMock()
+        provider.name = name
+        provider.provider_ref = ref
+        if error is not None:
+            provider.create_mailbox.side_effect = error
+        else:
+            provider.create_mailbox.return_value = mailbox
+        return provider
+
+    def _mail_config(self) -> dict:
+        return {"providers": [], "request_timeout": 1, "wait_timeout": 1, "wait_interval": 0.1, "user_agent": "t", "proxy": ""}
+
+    def test_rotates_to_next_provider_when_one_fails(self) -> None:
+        entries = [
+            {"type": "a", "provider_ref": "a#1", "enable": True},
+            {"type": "b", "provider_ref": "b#2", "enable": True},
+        ]
+        failing = self._fake_provider("a", "a#1", error=RuntimeError("池已用尽"))
+        mailbox = {"provider": "b", "address": "x@b.test"}
+        working = self._fake_provider("b", "b#2", mailbox=mailbox)
+
+        with (
+            patch.object(mail_provider, "_enabled_entries", return_value=entries),
+            patch.object(mail_provider, "_config", return_value=dict(self._mail_config())),
+            patch.object(mail_provider, "_create_provider", side_effect=[failing, working]),
+        ):
+            result = mail_provider.create_mailbox(self._mail_config())
+
+        self.assertEqual(result, mailbox)
+        failing.close.assert_called_once_with()
+        working.close.assert_called_once_with()
+
+    def test_aggregates_errors_when_every_provider_fails(self) -> None:
+        entries = [
+            {"type": "a", "provider_ref": "a#1", "enable": True},
+            {"type": "b", "provider_ref": "b#2", "enable": True},
+        ]
+        first = self._fake_provider("a", "a#1", error=RuntimeError("a 池已用尽"))
+        second = self._fake_provider("b", "b#2", error=RuntimeError("b 接口故障"))
+
+        with (
+            patch.object(mail_provider, "_enabled_entries", return_value=entries),
+            patch.object(mail_provider, "_config", return_value=dict(self._mail_config())),
+            patch.object(mail_provider, "_create_provider", side_effect=[first, second]),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "所有启用的邮箱提供商均无法创建邮箱") as raised:
+                mail_provider.create_mailbox(self._mail_config())
+
+        message = str(raised.exception)
+        self.assertIn("a#1", message)
+        self.assertIn("b#2", message)
+        first.close.assert_called_once_with()
+        second.close.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()
