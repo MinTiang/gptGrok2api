@@ -95,6 +95,32 @@ class PasswordlessSignupFallbackTest(unittest.TestCase):
         registrar._create_account.assert_called_once_with("Ada Lovelace", "1990-01-01", 1)
         mark_mailbox_result.assert_called_once_with(mailbox, success=True)
 
+    def test_registration_code_timeout_raises_delivery_timeout_with_provider_ref(self) -> None:
+        registrar = self._registrar()
+        registrar._platform_authorize = MagicMock(return_value="")
+        registrar._start_passwordless_signup = MagicMock()
+        registrar._validate_otp = MagicMock()
+        mailbox = {
+            "address": "slow@example.test",
+            "label": "慢速邮箱",
+            "provider": "tmp_mail",
+            "provider_ref": "tmp_mail#2",
+        }
+
+        with (
+            patch.object(openai_register, "create_mailbox", return_value=mailbox),
+            patch.object(openai_register, "wait_for_code", return_value=None),
+            patch.object(openai_register.mail_provider, "mark_mailbox_result") as mark_mailbox_result,
+            self.assertRaises(openai_register.OpenAIMailboxDeliveryTimeout) as raised,
+        ):
+            registrar.register(1)
+
+        self.assertEqual(raised.exception.provider_ref, "tmp_mail#2")
+        self.assertEqual(raised.exception.label, "慢速邮箱")
+        registrar._validate_otp.assert_not_called()
+        mark_mailbox_result.assert_called_once()
+        self.assertFalse(mark_mailbox_result.call_args.kwargs["success"])
+
     def test_other_passwordless_failure_does_not_use_legacy_registration(self) -> None:
         registrar = self._registrar()
         registrar._platform_authorize = MagicMock(return_value="")
@@ -1019,6 +1045,12 @@ class TraditionalChatGPTRegistrarTest(unittest.TestCase):
 
 
 class OpenAIExistingEmailRetryTest(unittest.TestCase):
+    def setUp(self) -> None:
+        openai_register._provider_delivery_exclusion.clear()
+
+    def tearDown(self) -> None:
+        openai_register._provider_delivery_exclusion.clear()
+
     def test_single_enabled_provider_delivery_timeout_stops_without_looping(self) -> None:
         failed_mailbox = {
             "address": "cf@example.test",
@@ -1069,6 +1101,43 @@ class OpenAIExistingEmailRetryTest(unittest.TestCase):
         failed.close.assert_called_once_with()
         fresh.close.assert_not_called()
         self.assertTrue(any("正在切换下一个邮箱来源" in str(call) for call in step.call_args_list))
+        self.assertIn("cloudflare_temp_email:cf", openai_register.soft_excluded_mail_provider_refs())
+
+    def test_soft_excluded_provider_is_skipped_by_next_task(self) -> None:
+        excluded = {"cloudflare_temp_email:cf"}
+        fresh = MagicMock()
+        fresh.register.return_value = {"email": "fresh@example.test", "access_token": "access"}
+
+        with (
+            patch.object(openai_register, "_enabled_mail_provider_count", return_value=2),
+            patch.object(openai_register, "mailbox_exclusions_for_new_task", return_value=set(excluded)),
+            patch.object(openai_register, "PlatformRegistrar", return_value=fresh) as factory,
+            patch.object(openai_register, "step") as step,
+        ):
+            registrar, _result = openai_register._register_with_fresh_email(3)
+
+        self.assertIs(registrar, fresh)
+        self.assertEqual(fresh.excluded_mail_provider_refs, excluded)
+        self.assertTrue(any("本次任务先跳过" in str(call) for call in step.call_args_list))
+        factory.assert_called_once_with(openai_register.config["proxy"])
+
+    def test_success_restores_soft_excluded_provider(self) -> None:
+        openai_register.exclude_mail_provider_for_delivery("cloudflare_temp_email:cf")
+        self.assertIn("cloudflare_temp_email:cf", openai_register.soft_excluded_mail_provider_refs())
+        openai_register.restore_mail_provider_delivery("cloudflare_temp_email:cf")
+        self.assertNotIn("cloudflare_temp_email:cf", openai_register.soft_excluded_mail_provider_refs())
+
+    def test_soft_exclusion_expires_after_ttl(self) -> None:
+        openai_register.exclude_mail_provider_for_delivery("cloudflare_temp_email:cf", ttl=600)
+        stale_key = "cloudflare_temp_email:cf"
+        openai_register._provider_delivery_exclusion[stale_key] = 0.0
+        self.assertNotIn(stale_key, openai_register.soft_excluded_mail_provider_refs())
+
+    def test_safety_valve_allows_all_providers_when_everything_excluded(self) -> None:
+        openai_register.exclude_mail_provider_for_delivery("cloudflare_temp_email:cf")
+
+        with patch.object(openai_register, "_enabled_mail_provider_count", return_value=1):
+            self.assertEqual(openai_register.mailbox_exclusions_for_new_task(), set())
 
     def test_replaces_existing_account_email_with_fresh_registrar(self) -> None:
         existing = MagicMock()

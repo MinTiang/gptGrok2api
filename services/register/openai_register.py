@@ -1898,9 +1898,10 @@ class PlatformRegistrar:
                 else:
                     step(index, "传统密码注册已提交，开始等待注册验证码")
                 step(index, "开始等待注册验证码")
-                code = wait_for_code(mailbox, register_proxy=self.proxy)
-                if not code:
-                    raise RuntimeError("等待注册验证码超时")
+                # 统一走投递超时包装：超时抛 OpenAIMailboxDeliveryTimeout（带
+                # provider_ref/label），触发上层"切换下一个邮箱来源"；CF 邮箱
+                # 额外获得 60 秒上限和一次自动重发。
+                code = _wait_for_chatgpt_registration_code(mailbox, index, self.proxy)
                 step(index, f"收到注册验证码: {code}")
                 otp_final_url = self._validate_otp(code, index)
                 callback_params = extract_oauth_callback_params_from_url(otp_final_url)
@@ -1939,6 +1940,7 @@ class PlatformRegistrar:
             "refresh_token": str(tokens.get("refresh_token") or "").strip(),
             "id_token": str(tokens.get("id_token") or "").strip(),
             "source_type": source_type,
+            "mail_provider_ref": str(mailbox.get("provider_ref") or "").strip(),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -3078,10 +3080,61 @@ def _enabled_mail_provider_count() -> int:
     )
 
 
+# ── 跨任务的邮箱来源软排除 ────────────────────────────────────
+# 验证码投递超时只影响单个任务：下个任务会重新抽到同一个坏来源，每个号
+# 都要白等完整超时时长，整批看起来像卡死。这里按来源记录一个带 TTL 的
+# 排除窗口，让后续任务在 TTL 内跳过它；来源恢复投递（注册成功）后立即
+# 解除。全部来源都被排除时安全阀放行，宁可重试也不停摆。
+PROVIDER_DELIVERY_EXCLUSION_TTL_SECONDS = 600.0
+_provider_delivery_exclusion: dict[str, float] = {}
+_provider_delivery_exclusion_lock = threading.Lock()
+
+
+def _prune_provider_delivery_exclusions(now: float) -> None:
+    expired = [ref for ref, until in _provider_delivery_exclusion.items() if until <= now]
+    for ref in expired:
+        _provider_delivery_exclusion.pop(ref, None)
+
+
+def exclude_mail_provider_for_delivery(provider_ref: str, *, ttl: float = PROVIDER_DELIVERY_EXCLUSION_TTL_SECONDS) -> None:
+    ref = str(provider_ref or "").strip()
+    if not ref:
+        return
+    with _provider_delivery_exclusion_lock:
+        _provider_delivery_exclusion[ref] = time.monotonic() + max(1.0, float(ttl))
+
+
+def restore_mail_provider_delivery(provider_ref: str) -> None:
+    ref = str(provider_ref or "").strip()
+    if not ref:
+        return
+    with _provider_delivery_exclusion_lock:
+        _provider_delivery_exclusion.pop(ref, None)
+
+
+def soft_excluded_mail_provider_refs() -> set[str]:
+    with _provider_delivery_exclusion_lock:
+        _prune_provider_delivery_exclusions(time.monotonic())
+        return set(_provider_delivery_exclusion)
+
+
+def mailbox_exclusions_for_new_task() -> set[str]:
+    excluded = soft_excluded_mail_provider_refs()
+    if excluded and len(excluded) >= max(1, _enabled_mail_provider_count()):
+        return set()
+    return excluded
+
+
 def _register_with_fresh_email(index: int) -> tuple[PlatformRegistrar, dict]:
     skipped = 0
     delivery_failures = 0
-    excluded_provider_refs: set[str] = set()
+    excluded_provider_refs: set[str] = mailbox_exclusions_for_new_task()
+    if excluded_provider_refs:
+        step(
+            index,
+            f"以下邮箱来源近期未收到验证码，本次任务先跳过：{', '.join(sorted(excluded_provider_refs))}",
+            "yellow",
+        )
     provider_count = max(1, _enabled_mail_provider_count())
     while True:
         stop_event = config.get("_stop_event")
@@ -3099,6 +3152,7 @@ def _register_with_fresh_email(index: int) -> tuple[PlatformRegistrar, dict]:
             delivery_failures += 1
             if error.provider_ref:
                 excluded_provider_refs.add(error.provider_ref)
+                exclude_mail_provider_for_delivery(error.provider_ref)
             remaining = provider_count - max(delivery_failures, len(excluded_provider_refs))
             if remaining <= 0:
                 raise RuntimeError(
@@ -3134,6 +3188,8 @@ def worker(index: int) -> dict:
         step(index, "任务启动")
         registrar, result = _register_with_fresh_email(index)
         cost = time.time() - start
+        # 该来源刚成功投递了验证码，立即解除它的投递软排除。
+        restore_mail_provider_delivery(str(result.get("mail_provider_ref") or ""))
         access_token = str(result["access_token"])
         account_service.add_account_items([result])
         archive_settings = config.get("agent_identity_archive")
