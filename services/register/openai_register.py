@@ -1002,16 +1002,23 @@ def validate_otp(
     device_id: str,
     code: str,
     fingerprint: dict[str, str] | None = None,
+    navigation_id: str = "",
 ):
     """Submit an email OTP once against the current authorization state.
 
     The upstream challenge is single-use. Retrying the same code with a
     different Sentinel context turns an actionable response into an
     ``invalid_state`` and makes the original failure impossible to diagnose.
+
+    Header set mirrors the real web client (2026-09 capture): no
+    ``oai-device-id`` here (device identity travels in cookies plus the
+    sentinel envelope), plus per-request ``x-access-flow-invocation-id`` and
+    the page-scoped ``x-openai-document-navigation-id``.
     """
     headers = _header_fingerprint(common_headers, fingerprint)
     headers["referer"] = f"{auth_base}/email-verification"
-    headers["oai-device-id"] = device_id
+    headers["x-access-flow-invocation-id"] = str(uuid.uuid4())
+    headers["x-openai-document-navigation-id"] = str(navigation_id or uuid.uuid4())
     headers.update(_make_trace_headers())
     return request_with_local_retry(
         session,
@@ -1331,6 +1338,7 @@ class PlatformRegistrar:
         # than spending ~60s on every subsequent endpoint.
         self._clearance_refresh_attempted_hosts: set[str] = set()
         self.device_id = str(uuid.uuid4())
+        self._auth_navigation_id = str(uuid.uuid4())
         self.code_verifier = ""
         self.platform_auth_code = ""
         self._platform_authorize_final_url = ""
@@ -1663,7 +1671,13 @@ class PlatformRegistrar:
 
     def _validate_otp(self, code: str, index: int) -> str:
         step(index, f"开始校验验证码 {code}")
-        resp, error = validate_otp(self.session, self.device_id, code, self.fingerprint)
+        resp, error = validate_otp(
+            self.session,
+            self.device_id,
+            code,
+            self.fingerprint,
+            navigation_id=str(getattr(self, "_auth_navigation_id", "") or ""),
+        )
         if resp is None or resp.status_code != 200:
             body = ""
             try:
@@ -1721,7 +1735,16 @@ class PlatformRegistrar:
     def _create_account(self, name: str, birthdate: str, index: int) -> None:
         step(index, "开始创建账号资料")
         url = f"{auth_base}/api/accounts/create_account"
-        headers = self._json_headers(f"{auth_base}/about-you")
+
+        def base_headers() -> dict:
+            headers = self._json_headers(f"{auth_base}/about-you")
+            # 对齐真实 web 客户端：每次请求新的 invocation id，页面级
+            # navigation id 在一次授权会话内复用。
+            headers["x-access-flow-invocation-id"] = str(uuid.uuid4())
+            headers["x-openai-document-navigation-id"] = str(getattr(self, "_auth_navigation_id", "") or uuid.uuid4())
+            return headers
+
+        headers = base_headers()
 
         # 使用新的 Sentinel 函数，同时获取 Sentinel Token 和 SO Token
         fp = _browser_fingerprint(self.fingerprint)
@@ -1744,7 +1767,7 @@ class PlatformRegistrar:
             bundle = self._refresh_cloudflare_clearance(auth_base, index)
             if bundle is None:
                 raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
-            headers = self._json_headers(f"{auth_base}/about-you")
+            headers = base_headers()
 
             # 重新生成 Sentinel Token 和 SO Token
             sentinel_token, so_token, _oai_sc = build_sentinel_with_so_token(
@@ -2165,11 +2188,15 @@ class ChatGPTWebRegistrar(PlatformRegistrar):
 
     def _create_chatgpt_profile(self, name: str, birthdate: str, index: int) -> str:
         step(index, "提交 ChatGPT 账号资料")
-        url = f"{auth_base}/api/accounts/user/profile"
+        # 2026-09 实测：about-you 提交走 /api/accounts/create_account（旧路径
+        # 为 /api/accounts/user/profile），响应直接返回带 code 的 continue_url。
+        url = f"{auth_base}/api/accounts/create_account"
         fp = _browser_fingerprint(self.fingerprint)
 
         def send():
             headers = self._json_headers(f"{auth_base}/about-you")
+            headers["x-access-flow-invocation-id"] = str(uuid.uuid4())
+            headers["x-openai-document-navigation-id"] = str(getattr(self, "_auth_navigation_id", "") or uuid.uuid4())
             sentinel_token, so_token, _oai_sc = build_sentinel_with_so_token(
                 self.session,
                 self.device_id,

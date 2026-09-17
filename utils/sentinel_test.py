@@ -67,11 +67,14 @@ class SentinelTokenTest(unittest.TestCase):
         vm_token = json.dumps(
             {"p": "sdk-proof", "t": "sdk-turnstile", "c": "challenge-token", "id": "device-id", "flow": "authorize_continue"}
         )
+        vm_so = json.dumps(
+            {"so": "so-proof", "c": "challenge-token", "id": "device-id", "flow": "authorize_continue"}
+        )
 
         with patch.object(
             sentinel,
             "_get_vm_sentinel_token",
-            return_value=(vm_token, "0vm-cookie"),
+            return_value=(vm_token, "0vm-cookie", vm_so),
         ):
             sentinel_value, so_token, oai_sc = sentinel.build_sentinel_with_so_token(
                 session,
@@ -80,7 +83,7 @@ class SentinelTokenTest(unittest.TestCase):
             )
 
         self.assertEqual(sentinel_value, vm_token)
-        self.assertEqual(so_token, "")
+        self.assertEqual(so_token, vm_so)
         self.assertEqual(oai_sc, "0vm-cookie")
 
 

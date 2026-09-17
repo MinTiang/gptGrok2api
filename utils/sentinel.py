@@ -42,27 +42,43 @@ class SentinelTokenGenerator:
         h ^= h >> 16
         return format(h & 0xFFFFFFFF, "08x")
 
+    # 环境探测值候选来自 2026-09 真实浏览器 proof 数组的实测形态。
+    _FEATURE_PROBES = (
+        "mediaSession\u2212[object MediaSession]",
+        "webkitPersistentStorage\u2212[object StorageManager]",
+        "getGamepads\u2212function getGamepads() { [native code] }",
+    )
+    _DOM_EVENT_NAMES = ("onwheel", "onscroll", "onclick", "onkeypress", "onsubmit")
+
     def _get_config(self) -> list:
         perf_now = random.uniform(1000, 50000)
+        react_key = "".join(random.choices("0123456789abcdefghijklmnopqrstuvwxyz", k=13))
         return [
-            "1920x1080",
+            random.choice((1920, 2400, 2560, 3000, 3840)),
             time.strftime("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)", time.gmtime()),
-            4294705152,
+            4395630592,
             random.random(),
             self.user_agent,
-            f"{SENTINEL_ORIGIN}/sentinel/{SENTINEL_VERSION}/sdk.js",
-            None,
+            SENTINEL_SDK_URL,
             None,
             "en-US",
-            random.random(),
-            random.choice(["vendorSub-undefined", "plugins-undefined", "mimeTypes-undefined", "hardwareConcurrency-undefined"]),
-            random.choice(["location", "implementation", "URL", "documentURI", "compatMode"]),
-            random.choice(["Object", "Function", "Array", "Number", "parseFloat", "undefined"]),
+            "en-US,en",
+            random.choice((4, 8, 12, 16)),
+            random.choice(self._FEATURE_PROBES),
+            f"__reactContainer${react_key}",
+            random.choice(self._DOM_EVENT_NAMES),
             perf_now,
             self.sid,
             "",
-            random.choice([4, 8, 12, 16]),
+            random.choice((4, 8, 12, 16)),
             time.time() * 1000 - perf_now,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
         ]
 
     @staticmethod
@@ -71,17 +87,16 @@ class SentinelTokenGenerator:
 
     def generate_requirements_token(self) -> str:
         data = self._get_config()
+        # 新数组里 [3] 是 PoW 计数槽（requirements 恒为 1），[9] 是
+        # hardwareConcurrency 槽（实测恒为 4/8/12/16 桶值），不再覆盖。
         data[3] = 1
-        data[9] = round(random.uniform(5, 50))
         return "gAAAAAC" + self._b64(data)
 
     def generate_token(self, seed: str, difficulty: str) -> str:
-        start = time.time()
         data = self._get_config()
         difficulty = str(difficulty or "0")
         for i in range(self.MAX_ATTEMPTS):
             data[3] = i
-            data[9] = round((time.time() - start) * 1000)
             payload = self._b64(data)
             if self._fnv1a_32(seed + payload)[: len(difficulty)] <= difficulty:
                 return "gAAAAAB" + payload + "~S"
@@ -95,8 +110,12 @@ DEFAULT_SENTINEL_USER_AGENT = (
     "Chrome/145.0.0.0 Safari/537.36"
 )
 DEFAULT_SENTINEL_SEC_CH_UA = '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"'
-SENTINEL_ORIGIN = "https://chatgpt.com"
-SENTINEL_VERSION = "20260423af3c"
+# 2026-09 起 Sentinel 全家桶（bootstrap/版本化 sdk.js/req/frame）迁移到
+# sentinel.openai.com；版本号由 sentinel_vm 引导时动态发现，这里只是
+# 无浏览器 VM 时的兜底常量。
+SENTINEL_ORIGIN = "https://sentinel.openai.com"
+SENTINEL_VERSION = "20260810913b"
+SENTINEL_SDK_URL = f"{SENTINEL_ORIGIN}/backend-api/sentinel/sdk.js"
 SENTINEL_REQ_URL = f"{SENTINEL_ORIGIN}/backend-api/sentinel/req"
 
 
@@ -107,7 +126,7 @@ def _get_vm_sentinel_token(
     *,
     user_agent: str,
     sec_ch_ua: str,
-) -> tuple[str, str] | None:
+) -> tuple[str, str, str] | None:
     if os.getenv("OPENAI_SENTINEL_DISABLE_VM"):
         return None
     try:
@@ -120,8 +139,8 @@ def _get_vm_sentinel_token(
             user_agent=user_agent,
             sec_ch_ua=sec_ch_ua,
         )
-        if isinstance(result, tuple) and len(result) == 2:
-            return str(result[0]), str(result[1])
+        if isinstance(result, tuple) and len(result) == 3:
+            return str(result[0]), str(result[1]), str(result[2])
         return None
     except Exception:
         return None
@@ -182,7 +201,7 @@ def build_sentinel_token(
     ch_ua = sec_ch_ua or DEFAULT_SENTINEL_SEC_CH_UA
     vm_bundle = _get_vm_sentinel_token(session, device_id, flow, user_agent=ua, sec_ch_ua=ch_ua)
     if vm_bundle:
-        return vm_bundle
+        return vm_bundle[0], vm_bundle[1]
     generator = SentinelTokenGenerator(device_id, ua)
     requirements_token = generator.generate_requirements_token()
     resp = session.post(
@@ -249,27 +268,16 @@ def build_sentinel_with_so_token(
 
     ``turnstile`` 和 Session Observer token 是两个独立字段：前者写入
     主 token 的 ``t`` 字段，后者才可作为 ``OpenAI-Sentinel-SO-Token``
-    请求头。不能把 Turnstile 解题结果复用为 SO token。当前无浏览器 VM
-    仅生成官方 SDK 的主 token；SO token 仍保守留空。
-
-    Args:
-        session: curl_cffi Session 实例
-        device_id: 设备 ID
-        flow: 流程标识（如 "oauth_create_account" 等）
-        user_agent: 可选的 User-Agent 覆盖
-        sec_ch_ua: 可选的 sec-ch-ua 覆盖
-
-    Returns:
-        (openai-sentinel-token, openai-sentinel-so-token, oai-sc cookie) 元组
-
-    Raises:
-        RuntimeError: sentinel 请求失败
+    请求头。SO token 由官方 SDK VM 在同一次 solve 里运行 collector_dx +
+    snapshot_dx 生成（``{"so","c","id","flow"}`` 信封）；VM 不可用或该
+    SDK 版本没有 SO 路径时保守留空，此时 /req 返回的
+    ``so.collector_dx/snapshot_dx`` 无法在协议层复算。
     """
     ua = user_agent or DEFAULT_SENTINEL_USER_AGENT
     ch_ua = sec_ch_ua or DEFAULT_SENTINEL_SEC_CH_UA
     vm_bundle = _get_vm_sentinel_token(session, device_id, flow, user_agent=ua, sec_ch_ua=ch_ua)
     if vm_bundle:
-        return vm_bundle[0], "", vm_bundle[1]
+        return vm_bundle[0], vm_bundle[2], vm_bundle[1]
     generator = SentinelTokenGenerator(device_id, ua)
     requirements_token = generator.generate_requirements_token()
     resp = session.post(

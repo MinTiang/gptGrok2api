@@ -1,6 +1,8 @@
 // Adapted from the MIT-licensed Sentinel VM adapter in the user-provided
 // gpt-outlook-register workspace. This process never performs network I/O;
 // Python owns the authenticated curl_cffi session and supplies the challenge.
+const realSetTimeout = globalThis.setTimeout ? globalThis.setTimeout.bind(globalThis) : null;
+const realClearTimeout = globalThis.clearTimeout ? globalThis.clearTimeout.bind(globalThis) : null;
 const EXPOSE_PATCH = 'return o?r?.[n(63)]?ce({so:o,c:r[n(63)]},t):o:null},t.token=ye,t}({});';
 const EXPOSE_REPLACEMENT =
   'return o?r?.[n(63)]?ce({so:o,c:r[n(63)]},t):o:null},t.token=ye,t.__debug_n=_n,t.__debug_bindProof=D,t}({});';
@@ -10,6 +12,12 @@ const SDK_GLOBAL_PATCH = 'var SentinelSDK=';
 const SDK_GLOBAL_REPLACEMENT = 'globalThis.SentinelSDK=';
 const CURRENT_EXPOSE_PATCH = 't.token=Ie,t}({});';
 const CURRENT_EXPOSE_REPLACEMENT = 't.token=Ie,t.__debug_n=Pn,t}({});';
+// 2026-09 起的 SDK（sentinel.openai.com 域）尾部导出形如 t.token=je。
+// 暴露 E（requirements/enforcement 引擎）、Rn（turnstile）、Mt/qt（Session
+// Observer collector/snapshot）、me（信封组装）、D/F（challenge→proof 的
+// WeakMap 绑定），让 solve 动作直接驱动，绕过 iframe postMessage 协议。
+const VM_TAIL_PATCH = 't.token=je,t}({});';
+const VM_TAIL_REPLACEMENT = 't.token=je,t.__vm={E,Rn,me,Mt,qt,de,Et,jt,xt,D,F},t}({});';
 
 function bytesToBase64(bytes) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
@@ -117,11 +125,11 @@ function installRuntime(payload) {
     hidden: false,
     visibilityState: 'visible',
     referrer: String(payload.checkout_url || 'https://chatgpt.com/checkout/'),
-    URL: String(payload.frame_url || 'https://chatgpt.com/backend-api/sentinel/frame.html'),
+    URL: String(payload.frame_url || 'https://sentinel.openai.com/backend-api/sentinel/frame.html'),
     cookie: `oai-did=${encodeURIComponent(payload.device_id || '')}`,
     scripts,
     currentScript: {
-      src: String(payload.sdk_url || 'https://chatgpt.com/sentinel/sdk.js'),
+      src: String(payload.sdk_url || 'https://sentinel.openai.com/backend-api/sentinel/sdk.js'),
       getAttribute() {
         return null;
       },
@@ -245,8 +253,8 @@ function installRuntime(payload) {
     value: navigatorValue,
   });
   globalThis.location = {
-    href: String(payload.frame_url || 'https://chatgpt.com/backend-api/sentinel/frame.html'),
-    origin: 'https://chatgpt.com',
+    href: String(payload.frame_url || 'https://sentinel.openai.com/backend-api/sentinel/frame.html'),
+    origin: 'https://sentinel.openai.com',
     pathname: '/backend-api/sentinel/frame.html',
     search: String(payload.frame_url || '').includes('?')
       ? `?${String(payload.frame_url).split('?').slice(1).join('?')}`
@@ -258,11 +266,11 @@ function installRuntime(payload) {
   globalThis.sessionStorage = createStorage();
   globalThis.__sentinel_init_pending = [];
   globalThis.__sentinel_token_pending = [];
-  globalThis.setTimeout = (callback) => {
-    if (typeof callback === 'function') callback();
-    return 1;
-  };
-  globalThis.clearTimeout = () => {};
+  // 新版 SDK 的 Session Observer 解释器依赖真实定时器：立即执行的 shim 会
+  // 让它 60s 看门狗同步触发（session_observer_vm_timeout）。真正的 Node
+  // 定时器在文件加载时就已捕获，这里原样使用。
+  globalThis.setTimeout = realSetTimeout;
+  globalThis.clearTimeout = realClearTimeout;
   globalThis.setInterval = () => 1;
   globalThis.clearInterval = () => {};
   globalThis.requestIdleCallback = (callback) => {
@@ -331,29 +339,90 @@ function loadPatchedSdk(source) {
   );
   sdk = sdk.replace(EXPOSE_PATCH, EXPOSE_REPLACEMENT);
   sdk = sdk.replace(CURRENT_EXPOSE_PATCH, CURRENT_EXPOSE_REPLACEMENT);
+  sdk = sdk.replace(VM_TAIL_PATCH, VM_TAIL_REPLACEMENT);
   eval(sdk);
+}
+
+function vmInternals() {
+  const sdk = globalThis.SentinelSDK;
+  return (sdk && sdk.__vm) || null;
 }
 
 async function run(payload, sdkSource) {
   installRuntime(payload);
   loadPatchedSdk(sdkSource);
+  const internals = vmInternals();
   if (payload.action === 'requirements') {
-    return { request_p: await globalThis.__debugP.getRequirementsToken() };
+    if (globalThis.__debugP && typeof globalThis.__debugP.getRequirementsToken === 'function') {
+      return { request_p: await globalThis.__debugP.getRequirementsToken() };
+    }
+    if (internals && internals.E && typeof internals.E.getRequirementsToken === 'function') {
+      return { request_p: await internals.E.getRequirementsToken() };
+    }
+    throw new Error('no requirements path in this sdk build');
   }
   if (payload.action === 'solve') {
     const challenge = payload.challenge || {};
     const requestProof = String(payload.request_p || '').trim();
     if (!requestProof) throw new Error('missing request_p');
-    const finalProof = await globalThis.__debugP.getEnforcementToken(challenge);
+    const flow = String(payload.flow || '');
+
+    let finalProof;
+    if (globalThis.__debugP && typeof globalThis.__debugP.getEnforcementToken === 'function') {
+      finalProof = await globalThis.__debugP.getEnforcementToken(challenge);
+    } else if (internals && internals.E && typeof internals.E.getEnforcementToken === 'function') {
+      finalProof = await internals.E.getEnforcementToken(challenge);
+    } else {
+      throw new Error('no enforcement path in this sdk build');
+    }
+
+    // 把 proof 绑定到 challenge 上：turnstile / SO 的 dx 程序都用它做 XOR key。
+    if (internals && typeof internals.D === 'function' && requestProof) {
+      internals.D(challenge, requestProof);
+    }
+
     const dx = challenge.turnstile ? challenge.turnstile.dx : null;
     let turnstile = null;
     if (dx) {
-      if (typeof globalThis.SentinelSDK.__debug_bindProof === 'function') {
+      if (internals && typeof internals.Rn === 'function') {
+        turnstile = await internals.Rn(challenge, dx);
+      } else if (
+        globalThis.SentinelSDK &&
+        typeof globalThis.SentinelSDK.__debug_bindProof === 'function'
+      ) {
         globalThis.SentinelSDK.__debug_bindProof(challenge, requestProof);
+        turnstile = await globalThis.SentinelSDK.__debug_n(challenge, dx);
       }
-      turnstile = await globalThis.SentinelSDK.__debug_n(challenge, dx);
     }
-    return { final_p: finalProof, t: turnstile };
+
+    // Session Observer：collector 先装进共享状态，snapshot 复用同一状态出 proof，
+    // 再按官方 me() 组装 {"so","c","id","flow"} 信封。失败时静默降级为无 so。
+    let soEnvelope = null;
+    const so = challenge.so;
+    if (
+      internals &&
+      typeof internals.Mt === 'function' &&
+      typeof internals.qt === 'function' &&
+      typeof internals.me === 'function' &&
+      so &&
+      true === so.required &&
+      typeof so.collector_dx === 'string' &&
+      typeof so.snapshot_dx === 'string' &&
+      so.collector_dx &&
+      so.snapshot_dx
+    ) {
+      try {
+        await internals.Mt(challenge);
+        const soProof = await internals.qt(so.snapshot_dx);
+        if (typeof soProof === 'string' && soProof.length >= 16) {
+          soEnvelope = internals.me({ so: soProof, c: String(challenge.token || '') }, flow);
+        }
+      } catch (_error) {
+        soEnvelope = null;
+      }
+    }
+
+    return { final_p: finalProof, t: turnstile, so: soEnvelope };
   }
   throw new Error(`unsupported action: ${payload.action}`);
 }

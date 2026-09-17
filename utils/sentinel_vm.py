@@ -15,15 +15,18 @@ import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from utils.turnstile import solve_turnstile_token
 
 
-SENTINEL_VERSION = "20260423af3c"
-SENTINEL_ORIGIN = "https://chatgpt.com"
-SENTINEL_BOOTSTRAP_URL = f"{SENTINEL_ORIGIN}/backend-api/sentinel/sdk.js"
-SENTINEL_SDK_URL = f"{SENTINEL_ORIGIN}/sentinel/{SENTINEL_VERSION}/sdk.js"
-SENTINEL_REQ_URL = f"{SENTINEL_ORIGIN}/backend-api/sentinel/req"
+SENTINEL_ORIGINS = ("https://sentinel.openai.com", "https://chatgpt.com")
+SENTINEL_FALLBACK_VERSION = "20260810913b"
+SENTINEL_BOOTSTRAP_PATH = "/backend-api/sentinel/sdk.js"
+SENTINEL_SDK_URL_RE = re.compile(
+    r"https://(?:sentinel\.openai\.com|chatgpt\.com)/sentinel/([A-Za-z0-9_-]+)/sdk\.js"
+)
+SENTINEL_REQ_PATH = "/backend-api/sentinel/req"
 RUNNER_PATH = Path(__file__).with_name("openai_sentinel_vm.js")
 MAX_SDK_BYTES = 4 * 1024 * 1024
 MIN_TURNSTILE_TOKEN_LENGTH = 16
@@ -80,44 +83,50 @@ def _cache_file(version: str) -> Path:
     return folder / "sdk.js"
 
 
-def _ensure_sdk(session: Any, *, timeout_seconds: int) -> Path:
-    version = SENTINEL_VERSION
-    sdk_url = SENTINEL_SDK_URL
-    try:
-        bootstrap = session.get(
-            SENTINEL_BOOTSTRAP_URL,
-            headers={
-                "accept": "*/*",
-                "accept-language": "pt-BR,pt;q=0.9,en;q=0.8",
-                "referer": f"{SENTINEL_ORIGIN}/",
-                "sec-fetch-dest": "script",
-                "sec-fetch-mode": "no-cors",
-                "sec-fetch-site": "same-origin",
-            },
-            timeout=timeout_seconds,
-            verify=False,
-        )
-        if getattr(bootstrap, "status_code", 0) == 200:
-            source = str(getattr(bootstrap, "text", "") or "")
-            match = re.search(
-                r"https://chatgpt\.com/sentinel/([A-Za-z0-9_-]+)/sdk\.js",
-                source,
+def _ensure_sdk(session: Any, *, timeout_seconds: int) -> tuple[Path, str]:
+    """返回 (sdk 缓存文件, 解析出的 sentinel 源)。
+
+    优先 sentinel.openai.com（2026-09 起官方 SDK 迁移到这里），失败时回退
+    chatgpt.com 旧域名，保持对旧部署的兼容。版本号从 bootstrap 响应中
+    动态发现，两个域名的 URL 都能识别。
+    """
+    version = SENTINEL_FALLBACK_VERSION
+    origin = SENTINEL_ORIGINS[0]
+    for candidate_origin in SENTINEL_ORIGINS:
+        try:
+            bootstrap = session.get(
+                f"{candidate_origin}{SENTINEL_BOOTSTRAP_PATH}",
+                headers={
+                    "accept": "*/*",
+                    "accept-language": "en-US,en;q=0.9",
+                    "referer": f"{candidate_origin}/",
+                    "sec-fetch-dest": "script",
+                    "sec-fetch-mode": "no-cors",
+                    "sec-fetch-site": "same-origin",
+                },
+                timeout=timeout_seconds,
+                verify=False,
             )
-            if match:
-                version = match.group(1)
-                sdk_url = match.group(0)
-    except Exception:
-        pass
+        except Exception:
+            continue
+        if getattr(bootstrap, "status_code", 0) != 200:
+            continue
+        source = str(getattr(bootstrap, "text", "") or "")
+        match = SENTINEL_SDK_URL_RE.search(source)
+        if match:
+            version = match.group(1)
+            origin = urlparse(match.group(0)).scheme + "://" + urlparse(match.group(0)).netloc
+            break
 
     cache_file = _cache_file(version)
     if cache_file.is_file() and 0 < cache_file.stat().st_size <= MAX_SDK_BYTES:
-        return cache_file
+        return cache_file, origin
     response = session.get(
-        sdk_url,
+        f"{origin}/sentinel/{version}/sdk.js",
         headers={
             "accept": "*/*",
-            "accept-language": "pt-BR,pt;q=0.9,en;q=0.8",
-            "referer": f"{SENTINEL_ORIGIN}/backend-api/sentinel/frame.html?sv={version}",
+            "accept-language": "en-US,en;q=0.9",
+            "referer": f"{origin}/backend-api/sentinel/frame.html?sv={version}",
             "sec-fetch-dest": "script",
             "sec-fetch-mode": "no-cors",
             "sec-fetch-site": "same-origin",
@@ -133,7 +142,7 @@ def _ensure_sdk(session: Any, *, timeout_seconds: int) -> Path:
     if not source or len(source) > MAX_SDK_BYTES:
         raise RuntimeError("invalid_sentinel_sdk_size")
     cache_file.write_bytes(source)
-    return cache_file
+    return cache_file, origin
 
 
 def _run_action(*, sdk_file: Path, payload: dict[str, Any], timeout_seconds: int) -> dict[str, Any]:
@@ -173,6 +182,7 @@ def _fetch_challenge(
     user_agent: str,
     sec_ch_ua: str,
     sdk_version: str,
+    origin: str,
     timeout_seconds: int,
 ) -> tuple[dict[str, Any], str]:
     before_cookie = ""
@@ -182,15 +192,15 @@ def _fetch_challenge(
         pass
     sec_ch_ua_platform = '"macOS"' if "Macintosh" in user_agent else '"Windows"'
     response = session.post(
-        SENTINEL_REQ_URL,
+        f"{origin}{SENTINEL_REQ_PATH}",
         data=json.dumps({"p": request_p, "id": device_id, "flow": flow}, separators=(",", ":")),
         headers={
             "accept": "*/*",
             "accept-encoding": "gzip, deflate, br, zstd",
-            "accept-language": "pt-BR,pt;q=0.9,en;q=0.8",
+            "accept-language": "en-US,en;q=0.9",
             "content-type": "text/plain;charset=UTF-8",
-            "origin": SENTINEL_ORIGIN,
-            "referer": f"{SENTINEL_ORIGIN}/backend-api/sentinel/frame.html?sv={sdk_version}",
+            "origin": origin,
+            "referer": f"{origin}/backend-api/sentinel/frame.html?sv={sdk_version}",
             "sec-ch-ua": sec_ch_ua,
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": sec_ch_ua_platform,
@@ -257,18 +267,25 @@ def get_sentinel_token_via_vm(
     sec_ch_ua: str = "",
     timeout_seconds: int = 30,
     log: Callable[[str], None] | None = None,
-) -> tuple[str, str] | None:
-    """Return a real-SDK primary Sentinel token, or ``None`` on a safe fallback."""
+) -> tuple[str, str, str] | None:
+    """Return ``(sentinel_header, oai_sc, so_header)`` from the official SDK VM.
+
+    The third element is the ``openai-sentinel-so-token`` envelope produced by
+    running the SDK's Session Observer collector/snapshot inside the same VM
+    run; it is ``""`` when the SDK version has no SO path or the snapshot
+    fails. ``None`` means the whole VM path failed and the caller should fall
+    back to the protocol implementation.
+    """
     log = log or (lambda _message: None)
     did = str(device_id or uuid.uuid4()).strip()
     ua = str(user_agent or DEFAULT_USER_AGENT).strip()
     ch_ua = str(sec_ch_ua or DEFAULT_SEC_CH_UA).strip()
     timeout_seconds = max(10, min(45, int(timeout_seconds)))
     try:
-        sdk_file = _ensure_sdk(session, timeout_seconds=timeout_seconds)
+        sdk_file, origin = _ensure_sdk(session, timeout_seconds=timeout_seconds)
         sdk_version = sdk_file.parent.name
-        sdk_url = f"{SENTINEL_ORIGIN}/sentinel/{sdk_version}/sdk.js"
-        frame_url = f"{SENTINEL_ORIGIN}/backend-api/sentinel/frame.html?sv={sdk_version}"
+        sdk_url = f"{origin}/sentinel/{sdk_version}/sdk.js"
+        frame_url = f"{origin}/backend-api/sentinel/frame.html?sv={sdk_version}"
         requirements = _run_action(
             sdk_file=sdk_file,
             payload={
@@ -291,6 +308,7 @@ def get_sentinel_token_via_vm(
             user_agent=ua,
             sec_ch_ua=ch_ua,
             sdk_version=sdk_version,
+            origin=origin,
             timeout_seconds=timeout_seconds,
         )
         solved = _run_action(
@@ -299,6 +317,7 @@ def get_sentinel_token_via_vm(
                 "action": "solve",
                 "device_id": did,
                 "user_agent": ua,
+                "flow": flow,
                 "request_p": request_p,
                 "challenge": challenge,
                 "sdk_url": sdk_url,
@@ -323,12 +342,13 @@ def get_sentinel_token_via_vm(
             {"p": final_p, "t": turnstile, "c": challenge_token, "id": did, "flow": flow},
             separators=(",", ":"),
         )
+        so_envelope = str(solved.get("so") or "").strip()
         log(
             "Sentinel VM success "
             f"(sdk={sdk_version}, p_len={len(final_p)}, t_len={len(turnstile)}, "
-            f"c_len={len(challenge_token)}, oai_sc_len={len(oai_sc)})"
+            f"c_len={len(challenge_token)}, so_len={len(so_envelope)}, oai_sc_len={len(oai_sc)})"
         )
-        return result, oai_sc
+        return result, oai_sc, so_envelope
     except Exception as exc:
         log(f"Sentinel VM fallback: {type(exc).__name__}: {str(exc)[:160]}")
         return None
