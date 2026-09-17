@@ -3796,6 +3796,49 @@ def _create_provider(
     raise RuntimeError(f"不支持的 mail.provider: {entry['type']}")
 
 
+class ProviderCreateCooldownError(RuntimeError):
+    """所有启用邮箱来源都处于创建失败冷却中。
+
+    单次创建失败的重试成本可达 3×request_timeout；把刚失败的来源按 TTL
+    跳过，避免后续任务反复为死服务买单。retry_after_seconds 告诉调用方
+    等多久再试，而不是立刻重新轮询全部来源。
+    """
+
+    def __init__(self, message: str, *, retry_after_seconds: float) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = max(1.0, float(retry_after_seconds))
+
+
+PROVIDER_CREATE_FAILURE_TTL_SECONDS = 300.0
+_provider_create_failures: dict[str, tuple[float, str]] = {}
+_provider_create_failure_lock = Lock()
+
+
+def _prune_provider_create_failures(now: float) -> None:
+    expired = [ref for ref, (until, _error) in _provider_create_failures.items() if until <= now]
+    for ref in expired:
+        _provider_create_failures.pop(ref, None)
+
+
+def _record_provider_create_failure(provider_ref: str, error: Exception | str) -> None:
+    ref = str(provider_ref or "").strip()
+    if not ref:
+        return
+    with _provider_create_failure_lock:
+        _provider_create_failures[ref] = (
+            time.monotonic() + PROVIDER_CREATE_FAILURE_TTL_SECONDS,
+            str(error)[:200],
+        )
+
+
+def _clear_provider_create_failure(provider_ref: str) -> None:
+    ref = str(provider_ref or "").strip()
+    if not ref:
+        return
+    with _provider_create_failure_lock:
+        _provider_create_failures.pop(ref, None)
+
+
 def create_mailbox(
     mail_config: dict,
     username: str | None = None,
@@ -3805,13 +3848,29 @@ def create_mailbox(
     enabled = [item for item in _enabled_entries(mail_config) if str(item.get("provider_ref") or "").strip() not in excluded]
     if not enabled:
         raise RuntimeError("没有剩余可用的邮箱提供商")
+    now = time.monotonic()
+    with _provider_create_failure_lock:
+        _prune_provider_create_failures(now)
+        create_dead = {
+            ref: (until, error)
+            for ref, (until, error) in _provider_create_failures.items()
+            if str(ref) in {str(item.get("provider_ref") or "").strip() for item in enabled}
+        }
+    if len(create_dead) >= len(enabled):
+        retry_after = max(until - now for until, _error in create_dead.values())
+        detail = "；".join(f"[{ref}] {error}" for ref, (_until, error) in sorted(create_dead.items()))
+        raise ProviderCreateCooldownError(
+            f"所有启用的邮箱提供商均处于创建失败冷却中（{int(retry_after)}s 后自动重试）：{detail}",
+            retry_after_seconds=retry_after,
+        )
     tried: set[str] = set()
     errors: list[str] = []
     stop_event = mail_config.get("_stop_event")
+    skip_refs = excluded | set(create_dead)
     for _ in range(len(enabled)):
         if stop_event is not None and stop_event.is_set():
             raise RuntimeError("注册任务已停止，邮箱创建中止")
-        provider = _create_provider(mail_config, excluded_provider_refs=excluded)
+        provider = _create_provider(mail_config, excluded_provider_refs=skip_refs)
         provider_key = f"{provider.name}#{provider.provider_ref}"
         try:
             if provider_key in tried:
@@ -3819,10 +3878,12 @@ def create_mailbox(
             tried.add(provider_key)
             mailbox = provider.create_mailbox(username)
             mailbox["_code_not_before"] = datetime.now(timezone.utc)
+            _clear_provider_create_failure(str(provider.provider_ref or ""))
             return mailbox
         except Exception as error:
-            # 单个来源失败（池耗尽、接口故障等）轮换到下一个来源；全部
-            # 失败时汇总报错，避免一个坏来源卡死整批注册。
+            # 单个来源失败（池耗尽、接口故障等）记录冷却并轮换到下一个
+            # 来源；全部失败时汇总报错，避免一个坏来源卡死整批注册。
+            _record_provider_create_failure(str(provider.provider_ref or ""), error)
             errors.append(f"[{provider.provider_ref or provider.name}] {str(error)[:200]}")
         finally:
             provider.close()

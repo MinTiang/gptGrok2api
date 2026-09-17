@@ -23,6 +23,7 @@ from services.json_file import read_json_object
 from services.openai_checkout_service import CheckoutSessionError, openai_checkout_service
 from services.proxy_service import ClearanceBundle, proxy_settings
 from services.register import mail_provider
+from services.register.mail_provider import ProviderCreateCooldownError
 from services.sub2api_service import (
     ensure_openai_agent_identity,
     normalize_sync_config,
@@ -832,13 +833,16 @@ def _wait_for_chatgpt_registration_code(
 
     try:
         code = poll()
-    except Exception as error:
-        if is_cf_mail:
-            raise OpenAIMailboxDeliveryTimeout(
-                mailbox,
-                f"查询邮件失败：{type(error).__name__}: {error}",
-            ) from error
+    except OpenAIMailboxDeliveryTimeout:
         raise
+    except Exception as error:
+        # 取信异常（连续失败、接口故障）同样转成投递超时：原始错误保留在
+        # 原因与 __cause__ 里，同时让上层能切换下一个邮箱来源，而不是让
+        # 整个任务死在一个坏来源上。
+        raise OpenAIMailboxDeliveryTimeout(
+            mailbox,
+            f"查询邮件失败：{type(error).__name__}: {error}",
+        ) from error
     if code:
         return code
 
@@ -3163,6 +3167,24 @@ def _register_with_fresh_email(index: int) -> tuple[PlatformRegistrar, dict]:
                 f"{error.label} 未收到验证码，正在切换下一个邮箱来源（剩余 {remaining} 个）",
                 "yellow",
             )
+        except ProviderCreateCooldownError as error:
+            # 所有来源的创建失败都还在冷却期：等一段时间后在本任务内重试，
+            # 既不空转打爆日志，也给恢复中的邮件服务留出时间。
+            registrar.close()
+            wait_seconds = min(60.0, error.retry_after_seconds)
+            stop_event = config.get("_stop_event")
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("注册任务已停止") from error
+            step(
+                index,
+                f"邮箱来源全部处于创建失败冷却中，{int(wait_seconds)}s 后自动重试",
+                "yellow",
+            )
+            if stop_event is not None:
+                if stop_event.wait(wait_seconds):
+                    raise RuntimeError("注册任务已停止") from error
+            else:
+                time.sleep(wait_seconds)
         except OpenAIEmailAlreadyRegistered as error:
             registrar.close()
             skipped += 1

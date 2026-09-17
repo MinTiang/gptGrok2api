@@ -684,7 +684,7 @@ class ChatGPTMailboxDeliveryTest(unittest.TestCase):
         wait_for_code.assert_called_once_with(mailbox, register_proxy="")
         resend.assert_not_called()
 
-    def test_non_cf_query_error_keeps_the_real_provider_failure(self) -> None:
+    def test_non_cf_query_error_switches_provider_and_keeps_reason(self) -> None:
         mailbox = {
             "address": "outlook@example.test",
             "provider": "outlook_token",
@@ -699,7 +699,7 @@ class ChatGPTMailboxDeliveryTest(unittest.TestCase):
         with (
             patch.object(openai_register, "wait_for_code", side_effect=query_error),
             patch.object(openai_register, "step"),
-            self.assertRaises(RuntimeError) as raised,
+            self.assertRaises(openai_register.OpenAIMailboxDeliveryTimeout) as raised,
         ):
             openai_register._wait_for_chatgpt_registration_code(
                 mailbox,
@@ -708,11 +708,9 @@ class ChatGPTMailboxDeliveryTest(unittest.TestCase):
                 resend=resend,
             )
 
-        self.assertIs(raised.exception, query_error)
-        self.assertNotIsInstance(
-            raised.exception,
-            openai_register.OpenAIMailboxDeliveryTimeout,
-        )
+        self.assertEqual(raised.exception.provider_ref, "outlook_token:primary")
+        self.assertIn("OutlookToken 刷新失败", str(raised.exception))
+        self.assertIsNotNone(raised.exception.__cause__)
         resend.assert_not_called()
 
 
@@ -1138,6 +1136,29 @@ class OpenAIExistingEmailRetryTest(unittest.TestCase):
 
         with patch.object(openai_register, "_enabled_mail_provider_count", return_value=1):
             self.assertEqual(openai_register.mailbox_exclusions_for_new_task(), set())
+
+    def test_provider_create_cooldown_waits_then_retries(self) -> None:
+        failed = MagicMock()
+        failed.register.side_effect = openai_register.ProviderCreateCooldownError(
+            "所有启用的邮箱提供商均处于创建失败冷却中",
+            retry_after_seconds=30,
+        )
+        fresh = MagicMock()
+        fresh.register.return_value = {"email": "fresh@example.test", "access_token": "access"}
+
+        with (
+            patch.object(openai_register, "_enabled_mail_provider_count", return_value=2),
+            patch.object(openai_register, "PlatformRegistrar", side_effect=[failed, fresh]),
+            patch.object(openai_register, "step") as step,
+            patch.object(openai_register.time, "sleep") as sleep,
+        ):
+            registrar, result = openai_register._register_with_fresh_email(3)
+
+        self.assertIs(registrar, fresh)
+        self.assertEqual(result["email"], "fresh@example.test")
+        sleep.assert_called_once()
+        self.assertLessEqual(sleep.call_args.args[0], 30.0)
+        self.assertTrue(any("创建失败冷却中" in str(call) for call in step.call_args_list))
 
     def test_replaces_existing_account_email_with_fresh_registrar(self) -> None:
         existing = MagicMock()

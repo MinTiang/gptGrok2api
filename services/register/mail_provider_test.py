@@ -1246,6 +1246,12 @@ class OutlookEmailProviderTest(unittest.TestCase):
 
 
 class CreateMailboxRotationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        mail_provider._provider_create_failures.clear()
+
+    def tearDown(self) -> None:
+        mail_provider._provider_create_failures.clear()
+
     @staticmethod
     def _fake_provider(name: str, ref: str, *, mailbox=None, error=None) -> MagicMock:
         provider = MagicMock()
@@ -1301,6 +1307,52 @@ class CreateMailboxRotationTest(unittest.TestCase):
         self.assertIn("b#2", message)
         first.close.assert_called_once_with()
         second.close.assert_called_once_with()
+
+    def test_create_failure_cooldown_skips_dead_provider_on_next_call(self) -> None:
+        entries = [
+            {"type": "a", "provider_ref": "a#1", "enable": True},
+            {"type": "b", "provider_ref": "b#2", "enable": True},
+        ]
+        failing = self._fake_provider("a", "a#1", error=RuntimeError("a 接口超时"))
+        first_working = self._fake_provider("b", "b#2", mailbox={"provider": "b", "address": "1@b.test"})
+        second_working = self._fake_provider("b", "b#2", mailbox={"provider": "b", "address": "2@b.test"})
+
+        with (
+            patch.object(mail_provider, "_enabled_entries", return_value=entries),
+            patch.object(mail_provider, "_config", return_value=dict(self._mail_config())),
+            patch.object(mail_provider, "_create_provider", side_effect=[failing, first_working, second_working]) as factory,
+        ):
+            first = mail_provider.create_mailbox(self._mail_config())
+            self.assertEqual(first["address"], "1@b.test")
+            second = mail_provider.create_mailbox(self._mail_config())
+
+        self.assertEqual(second["address"], "2@b.test")
+        # 第二次调用直接跳过冷却中的 a#1，只为 b#2 构造 provider。
+        self.assertEqual(factory.call_args_list[2].kwargs["excluded_provider_refs"], {"a#1"})
+
+    def test_all_providers_in_cooldown_fails_fast(self) -> None:
+        entries = [
+            {"type": "a", "provider_ref": "a#1", "enable": True},
+            {"type": "b", "provider_ref": "b#2", "enable": True},
+        ]
+        first = self._fake_provider("a", "a#1", error=RuntimeError("a 池已用尽"))
+        second = self._fake_provider("b", "b#2", error=RuntimeError("b 接口故障"))
+        never = self._fake_provider("a", "a#1")
+
+        with (
+            patch.object(mail_provider, "_enabled_entries", return_value=entries),
+            patch.object(mail_provider, "_config", return_value=dict(self._mail_config())),
+            patch.object(mail_provider, "_create_provider", side_effect=[first, second, never]) as factory,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "所有启用的邮箱提供商均无法创建邮箱"):
+                mail_provider.create_mailbox(self._mail_config())
+            with self.assertRaises(mail_provider.ProviderCreateCooldownError) as raised:
+                mail_provider.create_mailbox(self._mail_config())
+
+        self.assertGreaterEqual(raised.exception.retry_after_seconds, 1.0)
+        self.assertIn("a 池已用尽", str(raised.exception))
+        # 冷却期内不再构造任何 provider。
+        self.assertEqual(factory.call_count, 2)
 
 
 if __name__ == "__main__":
