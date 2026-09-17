@@ -3336,17 +3336,15 @@ class OutlookEmailWebSession:
             pass
 
     def _looks_logged_out(self, resp: Any) -> bool:
+        """登录页/会话失效重定向都会返回 HTML；JSON 响应一律视为未失效。
+
+        不能按 URL 是否以 /login 结尾判断：/login 本身的成功响应也会命中。
+        """
         try:
             content_type = str(resp.headers.get("Content-Type") or "")
         except Exception:
             content_type = ""
-        if "text/html" in content_type:
-            return True
-        try:
-            url = str(getattr(resp, "url", "") or "")
-        except Exception:
-            url = ""
-        return url.rstrip("/").endswith("/login")
+        return "text/html" in content_type
 
     def _ensure_login(self) -> None:
         if self._logged_in:
