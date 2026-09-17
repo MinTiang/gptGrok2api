@@ -219,7 +219,7 @@ export const defaultRegisterConfig: LegacyRegisterConfig = {
   },
   mail: {
     request_timeout: 30,
-    wait_timeout: 30,
+    wait_timeout: 150,
     wait_interval: 2,
     user_agent: '',
     providers: [],

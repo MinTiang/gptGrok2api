@@ -35,7 +35,7 @@ base_dir = Path(__file__).resolve().parent
 config = {
     "mail": {
         "request_timeout": 30,
-        "wait_timeout": 30,
+        "wait_timeout": 150,
         "wait_interval": 2,
         "api_use_register_proxy": True,
         "providers": [],
