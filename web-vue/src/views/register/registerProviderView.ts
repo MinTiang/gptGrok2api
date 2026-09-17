@@ -55,6 +55,7 @@ export const providerTypeOptions = [
   { value: 'yyds_mail', label: 'YYDS Mail' },
   { value: 'ddg_mail', label: 'DDG + CF 收件箱' },
   { value: 'outlook_token', label: 'Microsoft 邮箱凭据池' },
+  { value: 'outlook_email', label: 'Outlook 邮箱池（outlookEmail）' },
 ]
 
 export const providerTypeGroups = [{ options: providerTypeOptions }]
@@ -138,6 +139,7 @@ export const providerTypeKeys: Record<string, string[]> = {
   yyds_mail: ['api_base', 'api_key', 'domain', 'subdomain', 'wildcard'],
   ddg_mail: ['api_base', 'ddg_token', 'cf_inbox_jwt', 'admin_password', 'cf_api_key', 'cf_auth_mode', 'cf_create_path', 'cf_messages_path'],
   outlook_token: ['mailboxes', 'mode', 'imap_host', 'message_limit', 'alias_enabled', 'alias_per_email', 'alias_prefix', 'alias_include_original'],
+  outlook_email: ['api_base', 'api_key', 'web_password', 'success_tag', 'group_id', 'tag_ids', 'include_untagged', 'check_junk', 'use_proxy', 'message_limit'],
 }
 
 export const providerLocalOnlyKeys: Record<string, string[]> = {
@@ -409,6 +411,20 @@ export function defaultProvider(type = 'cloudmail_gen'): RegisterProvider {
         alias_per_email: 5,
         alias_prefix: 'c2api',
         alias_include_original: true,
+      }
+    case 'outlook_email':
+      return {
+        ...base,
+        api_base: '',
+        api_key: '',
+        web_password: '',
+        success_tag: 'gpt',
+        group_id: undefined,
+        tag_ids: '',
+        include_untagged: true,
+        check_junk: true,
+        use_proxy: true,
+        message_limit: 10,
       }
     default:
       return base
@@ -837,6 +853,10 @@ export function providerRequirementMessages(provider: RegisterProvider) {
       if (savedCount <= 0 && pendingOutlookCount(provider) <= 0) missing.push('Microsoft 邮箱凭据池')
       break
     }
+    case 'outlook_email':
+      requireValue(provider.api_base, 'outlookEmail API Base')
+      requireValue(provider.api_key, 'API Key')
+      break
     default:
       break
   }
@@ -845,11 +865,11 @@ export function providerRequirementMessages(provider: RegisterProvider) {
 }
 
 export function providerUsesApiBase(provider: RegisterProvider) {
-  return ['cloudmail_gen', 'cloudflare_temp_email', 'moemail', 'inbucket', 'yyds_mail', 'ddg_mail', 'donemail', 'icloud_api', 'luckygmail'].includes(providerType(provider))
+  return ['cloudmail_gen', 'cloudflare_temp_email', 'moemail', 'inbucket', 'yyds_mail', 'ddg_mail', 'donemail', 'icloud_api', 'luckygmail', 'outlook_email'].includes(providerType(provider))
 }
 
 export function providerUsesApiKey(provider: RegisterProvider) {
-  return ['tempmail_lol', 'moemail', 'duckmail', 'gptmail', 'yyds_mail', 'icloud_api', 'luckygmail'].includes(providerType(provider))
+  return ['tempmail_lol', 'moemail', 'duckmail', 'gptmail', 'yyds_mail', 'icloud_api', 'luckygmail', 'outlook_email'].includes(providerType(provider))
 }
 
 export function providerUsesAdminPassword(provider: RegisterProvider) {
@@ -871,6 +891,7 @@ export function apiBaseLabel(provider: RegisterProvider) {
   if (type === 'donemail') return 'DoneMail URL'
   if (type === 'icloud_api') return 'iCloud API Base'
   if (type === 'luckygmail') return 'LuckyGmail API Base'
+  if (type === 'outlook_email') return 'outlookEmail API Base'
   return 'API Base'
 }
 

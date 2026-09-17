@@ -3165,6 +3165,555 @@ class OutlookTokenProvider(BaseMailProvider):
         return None
 
 
+# ---------------------------------------------------------------------------
+# outlookEmail（https://github.com/assast/outlookEmail）实例对接
+#
+# 账号池由 outlookEmail 托管（token 刷新、Graph/IMAP 取信、代理、分组/标签）。
+# 本 provider 通过其对外 API（X-API-Key）领取未注册账号地址并轮询取信，
+# 注册成功后再用 Web Session（登录密码）给账号打成功标签；已打标签的账号
+# 在后续领取时自动跳过。
+# ---------------------------------------------------------------------------
+
+OUTLOOK_EMAIL_STATE_DB_FILE = DATA_DIR / "outlook_email_pool.db"
+OUTLOOK_EMAIL_IN_USE_STALE_SECONDS = 3600
+OUTLOOK_EMAIL_ACCOUNTS_CACHE_TTL = 30.0
+OUTLOOK_EMAIL_DEFAULT_SUCCESS_TAG = "gpt"
+OUTLOOK_EMAIL_STATES = {"in_use", "used", "failed"}
+
+
+def _outlook_email_state_connection() -> sqlite3.Connection:
+    path = OUTLOOK_EMAIL_STATE_DB_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=15)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=15000")
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError as exc:
+        if "locked" not in str(exc).lower():
+            connection.close()
+            raise
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS outlook_email_states (
+            email TEXT PRIMARY KEY,
+            state TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            lease_token TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS outlook_email_states_state_idx
+            ON outlook_email_states(state, updated_at);
+        """
+    )
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return connection
+
+
+def _outlook_email_entry_available(store: dict[str, dict[str, Any]], email: str) -> bool:
+    entry = store.get(str(email or "").strip().lower())
+    if not isinstance(entry, dict):
+        return True
+    current = str(entry.get("state") or "")
+    if current in {"used", "failed"}:
+        return False
+    if current == "in_use":
+        updated_at = str(entry.get("updated_at") or "")
+        try:
+            ts = datetime.fromisoformat(updated_at)
+            age = (datetime.now(timezone.utc) - (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc))).total_seconds()
+            return age >= OUTLOOK_EMAIL_IN_USE_STALE_SECONDS
+        except Exception:
+            return True
+    return True
+
+
+def _claim_outlook_email_account(accounts: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, str]:
+    """跨进程原子预占一个 outlookEmail 账号，返回 (账号, lease_token)。"""
+    now = datetime.now(timezone.utc)
+    lease_token = secrets.token_urlsafe(24)
+    with sqlite_connection_guard, closing(_outlook_email_state_connection()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute("SELECT email, state, updated_at FROM outlook_email_states").fetchall()
+        store = {
+            str(row["email"]).strip().lower(): {"state": str(row["state"]), "updated_at": str(row["updated_at"] or "")}
+            for row in rows
+        }
+        account = next(
+            (item for item in accounts if _outlook_email_entry_available(store, str(item.get("email") or ""))),
+            None,
+        )
+        if account is None:
+            connection.rollback()
+            return None, ""
+        email = str(account.get("email") or "").strip().lower()
+        connection.execute(
+            """
+            INSERT INTO outlook_email_states(email, state, reason, updated_at, lease_token)
+            VALUES (?, 'in_use', '', ?, ?)
+            ON CONFLICT(email) DO UPDATE SET
+                state = 'in_use', reason = '', updated_at = excluded.updated_at,
+                lease_token = excluded.lease_token
+            """,
+            (email, now.isoformat(), lease_token),
+        )
+        connection.commit()
+    return account, lease_token
+
+
+def _set_outlook_email_state(address: str, state: str, reason: str = "", *, lease_token: str = "") -> bool:
+    target = str(address or "").strip().lower()
+    if not target:
+        return False
+    with sqlite_connection_guard, closing(_outlook_email_state_connection()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if lease_token:
+            cursor = connection.execute(
+                """
+                UPDATE outlook_email_states
+                SET state = ?, reason = ?, updated_at = ?, lease_token = ''
+                WHERE email = ? AND lease_token = ?
+                """,
+                (str(state), str(reason or ""), datetime.now(timezone.utc).isoformat(), target, lease_token),
+            )
+        else:
+            cursor = connection.execute(
+                """
+                INSERT INTO outlook_email_states(email, state, reason, updated_at, lease_token)
+                VALUES (?, ?, ?, ?, '')
+                ON CONFLICT(email) DO UPDATE SET
+                    state = excluded.state, reason = excluded.reason,
+                    updated_at = excluded.updated_at, lease_token = ''
+                """,
+                (target, str(state), str(reason or ""), datetime.now(timezone.utc).isoformat()),
+            )
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+def _release_outlook_email_state(address: str, *, lease_token: str = "") -> bool:
+    target = str(address or "").strip().lower()
+    if not target:
+        return False
+    with sqlite_connection_guard, closing(_outlook_email_state_connection()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if lease_token:
+            cursor = connection.execute(
+                "DELETE FROM outlook_email_states WHERE email = ? AND state = 'in_use' AND lease_token = ?",
+                (target, lease_token),
+            )
+        else:
+            cursor = connection.execute(
+                "DELETE FROM outlook_email_states WHERE email = ? AND state = 'in_use'",
+                (target,),
+            )
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+class OutlookEmailWebSession:
+    """outlookEmail Web Session 客户端，仅用于注册成功后的打标签写入。
+
+    对外 API（X-API-Key）只读；写标签必须走 Web 登录 + CSRF。登录使用
+    permanent 会话，客户端实例内只需登录一次；401/登录页响应会自动重登。
+    """
+
+    def __init__(self, api_base: str, web_password: str, conf: dict):
+        self.api_base = str(api_base or "").strip().rstrip("/")
+        self.web_password = str(web_password or "")
+        self.conf = conf
+        self.session = _create_session(conf)
+        self._logged_in = False
+        self._csrf_token = ""
+
+    def close(self) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
+    def _looks_logged_out(self, resp: Any) -> bool:
+        try:
+            content_type = str(resp.headers.get("Content-Type") or "")
+        except Exception:
+            content_type = ""
+        if "text/html" in content_type:
+            return True
+        try:
+            url = str(getattr(resp, "url", "") or "")
+        except Exception:
+            url = ""
+        return url.rstrip("/").endswith("/login")
+
+    def _ensure_login(self) -> None:
+        if self._logged_in:
+            return
+        resp = self.session.post(
+            f"{self.api_base}/login",
+            json={"password": self.web_password, "session_duration_days": "permanent"},
+            headers={"User-Agent": self.conf["user_agent"], "Accept": "application/json"},
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        if self._looks_logged_out(resp) or resp.status_code in {401, 403}:
+            raise RuntimeError("outlookEmail 登录失败：密码错误或 Web 会话被拒绝")
+        if resp.status_code == 429:
+            raise RuntimeError(f"outlookEmail 登录被限速: {str(data.get('error') or resp.text[:200])}")
+        if resp.status_code != 200 or data.get("success") is not True:
+            raise RuntimeError(f"outlookEmail 登录失败: HTTP {resp.status_code}, {str(data.get('error') or resp.text[:200])}")
+        self._logged_in = True
+
+    def _refresh_csrf_token(self) -> str:
+        self._ensure_login()
+        resp = self.session.get(
+            f"{self.api_base}/api/csrf-token",
+            headers={"User-Agent": self.conf["user_agent"], "Accept": "application/json"},
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        token = str(data.get("csrf_token") or "").strip()
+        if resp.status_code != 200 or not token:
+            raise RuntimeError(f"outlookEmail 获取 CSRF Token 失败: HTTP {resp.status_code}")
+        self._csrf_token = token
+        return token
+
+    def _request_json(self, method: str, path: str, payload: dict | None = None) -> dict:
+        url = f"{self.api_base}{path}"
+        last_error = ""
+        for attempt in range(2):
+            self._ensure_login()
+            headers = {"User-Agent": self.conf["user_agent"], "Accept": "application/json"}
+            if payload is not None:
+                headers["X-CSRFToken"] = self._refresh_csrf_token()
+            resp = self.session.request(
+                method,
+                url,
+                json=payload,
+                headers=headers,
+                timeout=self.conf["request_timeout"],
+                verify=False,
+            )
+            try:
+                data = resp.json()
+            except Exception:
+                data = None
+            if isinstance(data, dict):
+                return data
+            last_error = f"HTTP {resp.status_code}, {resp.text[:200]}"
+            if self._looks_logged_out(resp) and attempt == 0:
+                self._logged_in = False
+                self._csrf_token = ""
+                continue
+            break
+        raise RuntimeError(f"outlookEmail Web API 请求失败 {path}: {last_error}")
+
+    def ensure_tag(self, name: str) -> int:
+        normalized = str(name or "").strip()
+        if not normalized:
+            raise RuntimeError("outlookEmail 成功标签名为空")
+        data = self._request_json("GET", "/api/tags")
+        for tag in data.get("tags") or []:
+            if isinstance(tag, dict) and str(tag.get("name") or "").strip().lower() == normalized.lower():
+                try:
+                    return int(tag.get("id"))
+                except (TypeError, ValueError):
+                    continue
+        created = self._request_json("POST", "/api/tags", {"name": normalized, "color": "#22c55e"})
+        tag = created.get("tag") if isinstance(created.get("tag"), dict) else {}
+        try:
+            return int(tag.get("id"))
+        except (TypeError, ValueError):
+            raise RuntimeError(f"outlookEmail 创建标签 {normalized} 失败: {created}")
+
+    def add_account_tag(self, account_id: int, tag_name: str) -> None:
+        tag_id = self.ensure_tag(tag_name)
+        data = self._request_json(
+            "POST",
+            "/api/accounts/tags",
+            {"account_ids": [int(account_id)], "tag_id": tag_id, "action": "add"},
+        )
+        if data.get("success") is not True:
+            raise RuntimeError(f"outlookEmail 打标签失败: {data.get('error') or data}")
+
+
+class OutlookEmailProvider(BaseMailProvider):
+    """从 outlookEmail 实例领取已导入的 Outlook 账号并轮询取信。
+
+    create_mailbox() 拉取账号列表（带 TTL 缓存），过滤掉已打成功标签或本地
+    标记为 used/failed 的账号后原子预占一个地址；wait_for_code() 通过对外
+    API 轮询收件箱与垃圾箱；注册成功由 mark_mailbox_result() 记录本地状态
+    并尽力给账号打上成功标签（默认 gpt）。
+    """
+
+    name = "outlook_email"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.label = str(entry.get("label") or self.provider_ref)
+        self.api_base = str(entry.get("api_base") or "").strip().rstrip("/")
+        self.api_key = str(entry.get("api_key") or "").strip()
+        self.web_password = str(entry.get("web_password") or "").strip()
+        self.success_tag = str(entry.get("success_tag") or OUTLOOK_EMAIL_DEFAULT_SUCCESS_TAG).strip() or OUTLOOK_EMAIL_DEFAULT_SUCCESS_TAG
+        self.group_id = self._int_or_none(entry.get("group_id"))
+        self.tag_ids = self._parse_tag_ids(entry.get("tag_ids"))
+        self.include_untagged = entry.get("include_untagged") is not False
+        self.check_junk = entry.get("check_junk") is not False
+        self.use_proxy = entry.get("use_proxy") is not False
+        self.message_limit = max(1, min(50, self._int_or_none(entry.get("message_limit")) or 10))
+        session_conf = conf if self.use_proxy else {**conf, "proxy": ""}
+        self.session = _create_session(session_conf)
+        self._accounts_cached_at = 0.0
+        self._accounts_cache: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _int_or_none(value: Any) -> int | None:
+        try:
+            if value is None or str(value).strip() == "":
+                return None
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _parse_tag_ids(cls, value: Any) -> list[int]:
+        if isinstance(value, str):
+            items = value.split(",")
+        elif isinstance(value, (list, tuple)):
+            items = list(value)
+        else:
+            items = []
+        result: list[int] = []
+        for item in items:
+            number = cls._int_or_none(item)
+            if number is not None:
+                result.append(number)
+        return result
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _external_get(self, path: str, params: dict[str, Any]) -> dict:
+        resp = self.session.get(
+            f"{self.api_base}{path}",
+            params=params,
+            headers={"X-API-Key": self.api_key, "User-Agent": self.conf["user_agent"], "Accept": "application/json"},
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
+        if resp.status_code != 200 or not isinstance(data, dict):
+            raise RuntimeError(f"outlookEmail 接口请求失败 {path}: HTTP {resp.status_code}, {resp.text[:200]}")
+        return data
+
+    def _fetch_accounts(self, *, force: bool = False) -> list[dict[str, Any]]:
+        if not self.api_base or not self.api_key:
+            raise RuntimeError("outlookEmail provider 缺少 api_base 或 api_key")
+        now = time.monotonic()
+        if not force and self._accounts_cache and now - self._accounts_cached_at < OUTLOOK_EMAIL_ACCOUNTS_CACHE_TTL:
+            return self._accounts_cache
+        params: dict[str, Any] = {"limit": 10000}
+        if self.group_id is not None:
+            params["group_id"] = self.group_id
+        if self.tag_ids:
+            params["tag_ids"] = ",".join(str(item) for item in self.tag_ids)
+            params["include_untagged"] = "true" if self.include_untagged else "false"
+        data = self._external_get("/api/external/accounts", params)
+        if data.get("success") is not True:
+            raise RuntimeError(f"outlookEmail 账号列表请求失败: {data.get('error') or data}")
+        accounts = [item for item in (data.get("accounts") or []) if isinstance(item, dict)]
+        self._accounts_cache = accounts
+        self._accounts_cached_at = now
+        return accounts
+
+    def _account_tag_names(self, account: dict[str, Any]) -> list[str]:
+        tags = account.get("tags")
+        if not isinstance(tags, list):
+            return []
+        return [str(item.get("name") or "").strip().lower() for item in tags if isinstance(item, dict)]
+
+    def _account_eligible(self, account: dict[str, Any]) -> bool:
+        status = str(account.get("status") or "").strip().lower()
+        if status and status != "active":
+            return False
+        return self.success_tag.strip().lower() not in self._account_tag_names(account)
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        accounts = [item for item in self._fetch_accounts() if self._account_eligible(item)]
+        if not accounts:
+            raise RuntimeError(
+                f"[{self.label}] outlookEmail 池暂无可用邮箱（已注册打标或本地用尽），"
+                f"请在 outlookEmail 导入新账号或调整成功标签过滤"
+            )
+        account, lease_token = _claim_outlook_email_account(accounts)
+        if account is None:
+            raise RuntimeError(f"[{self.label}] outlookEmail 池中的账号均被占用或已用尽，请稍后重试或导入新账号")
+        address = str(account.get("email") or "").strip()
+        account_id = self._int_or_none(account.get("id")) or 0
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "label": self.label,
+            "account_id": account_id,
+            "aliases": [str(item) for item in (account.get("aliases") or []) if str(item).strip()],
+            "_oe_lease_token": lease_token,
+            "_oe_api_base": self.api_base,
+            "_oe_web_password": self.web_password,
+            "_oe_success_tag": self.success_tag,
+            "_oe_account_id": account_id,
+        }
+
+    def _normalize_message(self, mailbox: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "provider": self.name,
+            "mailbox": mailbox["address"],
+            "message_id": str(item.get("id") or ""),
+            "subject": str(item.get("subject") or ""),
+            "sender": str(item.get("from") or ""),
+            "text_content": str(item.get("body_preview") or ""),
+            "html_content": "",
+            "received_at": _parse_received_at(item.get("date")),
+            "raw": item,
+        }
+
+    def fetch_recent_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
+        address = str(mailbox.get("address") or "").strip()
+        if not address:
+            raise RuntimeError("outlookEmail mailbox 缺少 address")
+        folders = ["inbox", "junkemail"] if self.check_junk else ["inbox"]
+        messages: list[dict[str, Any]] = []
+        for folder in folders:
+            data = self._external_get(
+                "/api/external/emails",
+                {"email": address, "folder": folder, "top": self.message_limit},
+            )
+            if data.get("success") is not True:
+                error = str(data.get("error") or "")
+                if "邮箱账号不存在" in error:
+                    raise RuntimeError(f"outlookEmail 邮箱地址不存在（可能已被删除）: {address}")
+                raise RuntimeError(f"outlookEmail 取信失败 ({folder}): {error or data}")
+            for item in data.get("emails") or []:
+                if isinstance(item, dict):
+                    messages.append(self._normalize_message(mailbox, item))
+        messages.sort(
+            key=lambda message: message.get("received_at")
+            or datetime(1970, 1, 1, tzinfo=timezone.utc),
+            reverse=True,
+        )
+        return messages
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        messages = self.fetch_recent_messages(mailbox)
+        return messages[0] if messages else None
+
+    def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
+        """轮询时遍历最近 N 封邮件（含垃圾箱），逐封提取验证码。"""
+        seen_value = mailbox.setdefault("_seen_code_message_refs", [])
+        if not isinstance(seen_value, list):
+            seen_value = []
+            mailbox["_seen_code_message_refs"] = seen_value
+        seen_refs = {str(item) for item in seen_value}
+
+        deadline = time.monotonic() + self.conf["wait_timeout"]
+        deadline = _cap_deadline_by_expiry(deadline, mailbox)
+        stop_event = mailbox.get("_stop_event")
+        consecutive_failures = 0
+        while time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                return None
+            try:
+                messages = self.fetch_recent_messages(mailbox)
+                consecutive_failures = 0
+            except Exception as exc:
+                if _is_terminal_mailbox_fetch_error(exc):
+                    raise
+                consecutive_failures += 1
+                if consecutive_failures >= 8:
+                    raise
+                interval = max(0.5, min(float(self.conf["wait_interval"] or 2), max(0.0, deadline - time.monotonic())))
+                if interval <= 0:
+                    break
+                if stop_event is not None:
+                    if stop_event.wait(interval):
+                        return None
+                else:
+                    time.sleep(interval)
+                continue
+            for message in messages:
+                if _message_before_code_boundary(mailbox, message):
+                    continue
+                ref = _message_tracking_ref(message)
+                if ref in seen_refs:
+                    continue
+                code = _extract_code(message)
+                if code:
+                    seen_value.append(ref)
+                    seen_refs.add(ref)
+                    return code
+                seen_refs.add(ref)
+            interval = max(0.2, self.conf["wait_interval"])
+            if stop_event is not None:
+                if stop_event.wait(interval):
+                    return None
+            else:
+                time.sleep(interval)
+        return None
+
+
+def _apply_outlook_email_success_tag(mailbox: dict[str, Any]) -> None:
+    """尽力通过 Web Session 给账号打成功标签；调用方负责吞掉异常。"""
+    api_base = str(mailbox.get("_oe_api_base") or "").strip()
+    web_password = str(mailbox.get("_oe_web_password") or "").strip()
+    account_id = OutlookEmailProvider._int_or_none(mailbox.get("_oe_account_id"))
+    tag_name = str(mailbox.get("_oe_success_tag") or OUTLOOK_EMAIL_DEFAULT_SUCCESS_TAG).strip()
+    if not api_base or not web_password or not account_id or not tag_name:
+        return
+    conf = {"request_timeout": 15, "wait_timeout": 15, "wait_interval": 1, "user_agent": "chatgpt2api", "proxy": ""}
+    web = OutlookEmailWebSession(api_base, web_password, conf)
+    try:
+        web.add_account_tag(account_id, tag_name)
+    finally:
+        web.close()
+
+
+def _mark_outlook_email_result(mailbox: dict[str, Any], *, success: bool, error: Exception | str | None = None) -> None:
+    """注册流程结束后更新 outlookEmail 账号本地状态并尽力打成功标签。
+
+    打标签是"尽力而为"：Web Session 写入失败只代表远端 UI 少一个标签，
+    本地 used 状态已保证该地址不会被本系统再次领取。
+    """
+    address = str(mailbox.get("address") or "").strip()
+    if not address:
+        return
+    if success or _mailbox_error_implies_registered(success=success, error=error):
+        _set_outlook_email_state(address, "used", lease_token=str(mailbox.get("_oe_lease_token") or ""))
+        try:
+            _apply_outlook_email_success_tag(mailbox)
+        except Exception:
+            pass
+    else:
+        _set_outlook_email_state(
+            address,
+            "failed",
+            str(error or "")[:300],
+            lease_token=str(mailbox.get("_oe_lease_token") or ""),
+        )
+
+
 def _entries(mail_config: dict) -> list[dict]:
     result: list[dict] = []
     counters: dict[str, int] = {}
@@ -3240,6 +3789,8 @@ def _create_provider(
         return YydsMailProvider(entry, conf)
     if entry["type"] == "outlook_token":
         return OutlookTokenProvider(entry, conf)
+    if entry["type"] == "outlook_email":
+        return OutlookEmailProvider(entry, conf)
     raise RuntimeError(f"不支持的 mail.provider: {entry['type']}")
 
 
@@ -3315,7 +3866,8 @@ def wait_for_code(
         provider.close()
 
 
-def _icloud_mailbox_result_claimed(*, success: bool, error: Exception | str | None) -> bool:
+def _mailbox_error_implies_registered(*, success: bool, error: Exception | str | None) -> bool:
+    """注册失败但错误表明邮箱本身已有账号时，视为该邮箱已被消费（应打标/记为 used）。"""
     if success:
         return True
     reason = str(error or "").strip().lower()
@@ -3356,12 +3908,15 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
             try:
                 provider.update_claim(
                     mailbox,
-                    _icloud_mailbox_result_claimed(success=success, error=error),
+                    _mailbox_error_implies_registered(success=success, error=error),
                 )
             finally:
                 provider.close()
         except Exception:
             pass
+        return
+    if str(mailbox.get("provider") or "") == OutlookEmailProvider.name:
+        _mark_outlook_email_result(mailbox, success=success, error=error)
         return
     if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
         return
@@ -3394,6 +3949,12 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
 
 def release_mailbox(mailbox: dict) -> None:
     """把 outlook_token 邮箱从 in_use 释放回未使用（用于流程主动放弃且未消费验证码时）。"""
+    if str(mailbox.get("provider") or "") == OutlookEmailProvider.name:
+        _release_outlook_email_state(
+            str(mailbox.get("address") or ""),
+            lease_token=str(mailbox.get("_oe_lease_token") or ""),
+        )
+        return
     if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
         return
     _release_outlook_token_state(

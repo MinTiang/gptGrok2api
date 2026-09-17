@@ -4,6 +4,7 @@ import json
 import unittest
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -889,6 +890,359 @@ class OutlookTokenProviderTest(unittest.TestCase):
 
         self.assertEqual(code, "246802")
         self.assertEqual(fetch.call_count, 2)
+
+
+class OutlookEmailWebSessionTest(unittest.TestCase):
+    conf = {
+        "request_timeout": 5,
+        "wait_timeout": 5,
+        "wait_interval": 0.2,
+        "user_agent": "test-agent",
+        "proxy": "",
+    }
+
+    @staticmethod
+    def _response(payload, status_code=200, content_type="application/json") -> MagicMock:
+        response = MagicMock()
+        response.status_code = status_code
+        response.text = str(payload)
+        if payload is None:
+            response.json.side_effect = ValueError("not json")
+        else:
+            response.json.return_value = payload
+        response.headers = {"Content-Type": content_type}
+        response.url = "http://oe.test/api/tags"
+        return response
+
+    def _web_session(self) -> mail_provider.OutlookEmailWebSession:
+        return mail_provider.OutlookEmailWebSession("http://oe.test", "secret", dict(self.conf))
+
+    def test_add_account_tag_reuses_existing_tag(self) -> None:
+        web = self._web_session()
+        try:
+            http = MagicMock()
+            http.post.return_value = self._response({"success": True})
+            http.get.return_value = self._response({"csrf_token": "token-1"})
+            http.request.side_effect = [
+                self._response({"success": True, "tags": [{"id": 3, "name": "gpt"}]}),
+                self._response({"success": True, "message": "成功处理 1 个账号"}),
+            ]
+            web.session = http
+            web.add_account_tag(7, "gpt")
+
+            login_kwargs = http.post.call_args.kwargs
+            self.assertEqual(login_kwargs["json"], {"password": "secret", "session_duration_days": "permanent"})
+            tag_call = http.request.call_args_list[1]
+            self.assertEqual(tag_call.args[0], "POST")
+            self.assertEqual(tag_call.args[1], "http://oe.test/api/accounts/tags")
+            self.assertEqual(tag_call.kwargs["json"], {"account_ids": [7], "tag_id": 3, "action": "add"})
+            self.assertEqual(tag_call.kwargs["headers"]["X-CSRFToken"], "token-1")
+        finally:
+            web.close()
+
+    def test_add_account_tag_creates_missing_tag(self) -> None:
+        web = self._web_session()
+        try:
+            http = MagicMock()
+            http.post.return_value = self._response({"success": True})
+            http.get.return_value = self._response({"csrf_token": "token-1"})
+            http.request.side_effect = [
+                self._response({"success": True, "tags": [{"id": 1, "name": "other"}]}),
+                self._response({"success": True, "tag": {"id": 9, "name": "gpt", "color": "#22c55e"}}),
+                self._response({"success": True}),
+            ]
+            web.session = http
+            web.add_account_tag(8, "gpt")
+
+            create_call = http.request.call_args_list[1]
+            self.assertEqual(create_call.args[1], "http://oe.test/api/tags")
+            self.assertEqual(create_call.kwargs["json"], {"name": "gpt", "color": "#22c55e"})
+            bind_call = http.request.call_args_list[2]
+            self.assertEqual(bind_call.kwargs["json"], {"account_ids": [8], "tag_id": 9, "action": "add"})
+        finally:
+            web.close()
+
+    def test_relogs_in_when_session_expires(self) -> None:
+        web = self._web_session()
+        try:
+            http = MagicMock()
+            http.post.return_value = self._response({"success": True})
+            http.get.return_value = self._response({"csrf_token": "token-1"})
+            http.request.side_effect = [
+                self._response("<html>login page</html>", content_type="text/html"),
+                self._response({"success": True, "tags": []}),
+                self._response({"success": True, "tag": {"id": 5, "name": "gpt"}}),
+                self._response({"success": True}),
+            ]
+            web.session = http
+            web.add_account_tag(2, "gpt")
+
+            self.assertEqual(http.post.call_count, 2)
+            self.assertEqual(http.request.call_count, 4)
+        finally:
+            web.close()
+
+    def test_wrong_password_raises(self) -> None:
+        web = self._web_session()
+        try:
+            http = MagicMock()
+            http.post.return_value = self._response({"success": False, "error": "密码错误"})
+            web.session = http
+            with self.assertRaises(RuntimeError):
+                web.ensure_tag("gpt")
+        finally:
+            web.close()
+
+
+class OutlookEmailProviderTest(unittest.TestCase):
+    entry = {
+        "type": "outlook_email",
+        "id": "oe-1",
+        "provider_ref": "outlook_email:oe-1",
+        "label": "OE 测试",
+        "enable": True,
+        "api_base": "http://oe.test",
+        "api_key": "key-1",
+        "web_password": "secret",
+        "success_tag": "gpt",
+    }
+    conf = {
+        "request_timeout": 5,
+        "wait_timeout": 2,
+        "wait_interval": 0.2,
+        "user_agent": "test-agent",
+        "proxy": "",
+    }
+
+    @staticmethod
+    def _account(email: str, *, tags=None, status="active", account_id=1) -> dict:
+        return {
+            "id": account_id,
+            "email": email,
+            "aliases": [],
+            "status": status,
+            "tags": tags or [],
+        }
+
+    def _provider(self, **overrides) -> mail_provider.OutlookEmailProvider:
+        entry = {**self.entry, **overrides}
+        return mail_provider.OutlookEmailProvider(entry, dict(self.conf))
+
+    def test_create_mailbox_skips_tagged_and_inactive_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(mail_provider, "OUTLOOK_EMAIL_STATE_DB_FILE", Path(temp_dir) / "oe.db"):
+                provider = self._provider()
+                try:
+                    accounts = [
+                        self._account("used@outlook.test", tags=[{"id": 1, "name": "gpt"}]),
+                        self._account("broken@outlook.test", status="error"),
+                        self._account("fresh@outlook.test", account_id=3),
+                    ]
+                    with patch.object(provider, "_fetch_accounts", return_value=accounts):
+                        mailbox = provider.create_mailbox()
+
+                    self.assertEqual(mailbox["address"], "fresh@outlook.test")
+                    self.assertEqual(mailbox["account_id"], 3)
+                    self.assertEqual(mailbox["provider"], "outlook_email")
+                    self.assertEqual(mailbox["_oe_success_tag"], "gpt")
+                    self.assertTrue(mailbox["_oe_lease_token"])
+                finally:
+                    provider.close()
+
+    def test_create_mailbox_raises_when_pool_exhausted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(mail_provider, "OUTLOOK_EMAIL_STATE_DB_FILE", Path(temp_dir) / "oe.db"):
+                provider = self._provider()
+                try:
+                    accounts = [self._account("used@outlook.test", tags=[{"id": 1, "name": "GPT"}])]
+                    with patch.object(provider, "_fetch_accounts", return_value=accounts):
+                        with self.assertRaises(RuntimeError):
+                            provider.create_mailbox()
+                finally:
+                    provider.close()
+
+    def test_claim_is_lease_protected_across_providers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(mail_provider, "OUTLOOK_EMAIL_STATE_DB_FILE", Path(temp_dir) / "oe.db"):
+                accounts = [
+                    self._account("one@outlook.test", account_id=1),
+                    self._account("two@outlook.test", account_id=2),
+                ]
+                first = self._provider()
+                second = self._provider()
+                try:
+                    with patch.object(first, "_fetch_accounts", return_value=accounts), patch.object(
+                        second, "_fetch_accounts", return_value=accounts
+                    ):
+                        first_mailbox = first.create_mailbox()
+                        second_mailbox = second.create_mailbox()
+                    self.assertNotEqual(first_mailbox["address"], second_mailbox["address"])
+
+                    mail_provider.release_mailbox(first_mailbox)
+                    with patch.object(first, "_fetch_accounts", return_value=accounts):
+                        replacement = first.create_mailbox()
+                    self.assertEqual(replacement["address"], first_mailbox["address"])
+
+                    # 迟到的旧 lease 不能覆盖新租约的 in_use 状态
+                    with patch.object(mail_provider, "_apply_outlook_email_success_tag"):
+                        mail_provider.mark_mailbox_result(first_mailbox, success=True)
+                    with closing(mail_provider._outlook_email_state_connection()) as connection:
+                        row = connection.execute(
+                            "SELECT state FROM outlook_email_states WHERE email = ?",
+                            (first_mailbox["address"],),
+                        ).fetchone()
+                    self.assertEqual(row["state"], "in_use")
+                finally:
+                    first.close()
+                    second.close()
+
+    def _claimed_mailbox(self, provider: mail_provider.OutlookEmailProvider) -> dict:
+        accounts = [self._account("one@outlook.test", account_id=11)]
+        with patch.object(provider, "_fetch_accounts", return_value=accounts):
+            return provider.create_mailbox()
+
+    def test_mark_result_success_sets_used_and_attempts_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(mail_provider, "OUTLOOK_EMAIL_STATE_DB_FILE", Path(temp_dir) / "oe.db"):
+                provider = self._provider()
+                try:
+                    mailbox = self._claimed_mailbox(provider)
+                    with patch.object(mail_provider, "_apply_outlook_email_success_tag") as tag_mock:
+                        mail_provider.mark_mailbox_result(mailbox, success=True)
+                    tag_mock.assert_called_once_with(mailbox)
+                    with closing(mail_provider._outlook_email_state_connection()) as connection:
+                        row = connection.execute(
+                            "SELECT state FROM outlook_email_states WHERE email = ?",
+                            ("one@outlook.test",),
+                        ).fetchone()
+                    self.assertEqual(row["state"], "used")
+                finally:
+                    provider.close()
+
+    def test_mark_result_already_registered_counts_as_used(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(mail_provider, "OUTLOOK_EMAIL_STATE_DB_FILE", Path(temp_dir) / "oe.db"):
+                provider = self._provider()
+                try:
+                    mailbox = self._claimed_mailbox(provider)
+                    with patch.object(mail_provider, "_apply_outlook_email_success_tag") as tag_mock:
+                        mail_provider.mark_mailbox_result(
+                            mailbox, success=False, error=RuntimeError("OpenAIEmailAlreadyRegistered: exists")
+                        )
+                    tag_mock.assert_called_once()
+                    with closing(mail_provider._outlook_email_state_connection()) as connection:
+                        row = connection.execute(
+                            "SELECT state FROM outlook_email_states WHERE email = ?",
+                            ("one@outlook.test",),
+                        ).fetchone()
+                    self.assertEqual(row["state"], "used")
+                finally:
+                    provider.close()
+
+    def test_mark_result_transient_failure_records_failed_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(mail_provider, "OUTLOOK_EMAIL_STATE_DB_FILE", Path(temp_dir) / "oe.db"):
+                provider = self._provider()
+                try:
+                    mailbox = self._claimed_mailbox(provider)
+                    with patch.object(mail_provider, "_apply_outlook_email_success_tag") as tag_mock:
+                        mail_provider.mark_mailbox_result(mailbox, success=False, error=RuntimeError("验证码超时"))
+                    tag_mock.assert_not_called()
+                    with closing(mail_provider._outlook_email_state_connection()) as connection:
+                        row = connection.execute(
+                            "SELECT state, reason FROM outlook_email_states WHERE email = ?",
+                            ("one@outlook.test",),
+                        ).fetchone()
+                    self.assertEqual(row["state"], "failed")
+                finally:
+                    provider.close()
+
+    def test_fetch_recent_messages_merges_inbox_and_junk(self) -> None:
+        provider = self._provider()
+        try:
+            def fake_get(path: str, params: dict) -> dict:
+                self.assertEqual(path, "/api/external/emails")
+                if params["folder"] == "inbox":
+                    return {
+                        "success": True,
+                        "emails": [
+                            {
+                                "id": "m-inbox",
+                                "subject": "Older mail",
+                                "from": "a@example.test",
+                                "date": "2026-09-17T09:00:00Z",
+                                "body_preview": "hello",
+                                "folder": "inbox",
+                            }
+                        ],
+                    }
+                return {
+                    "success": True,
+                    "emails": [
+                        {
+                            "id": "m-junk",
+                            "subject": "Your code",
+                            "from": "noreply@openai.com",
+                            "date": "2026-09-17T10:00:00Z",
+                            "body_preview": "Verification code: 654321",
+                            "folder": "junkemail",
+                        }
+                    ],
+                }
+
+            with patch.object(provider, "_external_get", side_effect=fake_get):
+                messages = provider.fetch_recent_messages({"address": "one@outlook.test"})
+
+            self.assertEqual([m["message_id"] for m in messages], ["m-junk", "m-inbox"])
+            newest = messages[0]
+            self.assertEqual(newest["provider"], "outlook_email")
+            self.assertEqual(newest["mailbox"], "one@outlook.test")
+            self.assertEqual(newest["text_content"], "Verification code: 654321")
+            self.assertEqual(newest["html_content"], "")
+            self.assertIsNotNone(newest["received_at"])
+        finally:
+            provider.close()
+
+    def test_wait_for_code_extracts_code_from_preview(self) -> None:
+        provider = self._provider()
+        try:
+            def fake_get(path: str, params: dict) -> dict:
+                if params["folder"] == "inbox":
+                    return {
+                        "success": True,
+                        "emails": [
+                            {
+                                "id": "m-1",
+                                "subject": "Verify your email",
+                                "from": "noreply@openai.com",
+                                "date": "2026-09-17T10:00:00Z",
+                                "body_preview": "Your code is 246802. Enter it to continue.",
+                            }
+                        ],
+                    }
+                return {"success": True, "emails": []}
+
+            with patch.object(provider, "_external_get", side_effect=fake_get):
+                code = provider.wait_for_code({"address": "one@outlook.test"})
+            self.assertEqual(code, "246802")
+        finally:
+            provider.close()
+
+    def test_check_junk_false_only_queries_inbox(self) -> None:
+        provider = self._provider(check_junk=False)
+        try:
+            folders: list[str] = []
+
+            def fake_get(path: str, params: dict) -> dict:
+                folders.append(params["folder"])
+                return {"success": True, "emails": []}
+
+            with patch.object(provider, "_external_get", side_effect=fake_get):
+                messages = provider.fetch_recent_messages({"address": "one@outlook.test"})
+            self.assertEqual(folders, ["inbox"])
+            self.assertEqual(messages, [])
+        finally:
+            provider.close()
 
 
 if __name__ == "__main__":

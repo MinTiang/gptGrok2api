@@ -207,6 +207,105 @@
           </Checkbox>
         </label>
 
+        <template v-if="currentType === 'outlook_email'">
+          <label class="register-field">
+            <span class="register-label">Web 登录密码</span>
+            <Input
+              :model-value="provider.web_password"
+              block
+              root-class="font-mono"
+              :disabled="disabled"
+              placeholder="outlookEmail 控制台登录密码"
+              @update:model-value="value => emit('update-field', index, 'web_password', String(value || '').trim())"
+            />
+          </label>
+
+          <label class="register-field">
+            <span class="register-label">成功标签</span>
+            <Input
+              :model-value="provider.success_tag"
+              block
+              :disabled="disabled"
+              placeholder="gpt"
+              @update:model-value="value => emit('update-field', index, 'success_tag', String(value || '').trim())"
+            />
+          </label>
+
+          <label class="register-field">
+            <span class="register-label">分组 ID（可选）</span>
+            <Input
+              :model-value="provider.group_id"
+              type="number"
+              min="1"
+              step="1"
+              block
+              :disabled="disabled"
+              @update:model-value="value => emit('update-field', index, 'group_id', numberModelValue(value))"
+            />
+          </label>
+
+          <label class="register-field">
+            <span class="register-label">标签 ID 过滤（可选）</span>
+            <Input
+              :model-value="provider.tag_ids"
+              block
+              :disabled="disabled"
+              placeholder="1,2 仅领取含任一标签的账号"
+              @update:model-value="value => emit('update-field', index, 'tag_ids', String(value || '').trim())"
+            />
+          </label>
+
+          <label class="register-field">
+            <span class="register-label">每次取信数量</span>
+            <Input
+              :model-value="provider.message_limit"
+              type="number"
+              min="1"
+              max="50"
+              step="1"
+              block
+              :disabled="disabled"
+              @update:model-value="value => emit('update-field', index, 'message_limit', numberModelValue(value))"
+            />
+          </label>
+
+          <label class="register-checkbox-field register-checkbox-field--compact register-field--full">
+            <Checkbox
+              :model-value="provider.include_untagged"
+              :disabled="disabled"
+              @update:model-value="value => emit('update-field', index, 'include_untagged', Boolean(value))"
+            >
+              按标签过滤时包含未打标签账号
+            </Checkbox>
+          </label>
+
+          <label class="register-checkbox-field register-checkbox-field--compact register-field--full">
+            <Checkbox
+              :model-value="provider.check_junk"
+              :disabled="disabled"
+              @update:model-value="value => emit('update-field', index, 'check_junk', Boolean(value))"
+            >
+              同时检查垃圾邮件文件夹
+            </Checkbox>
+          </label>
+
+          <label class="register-checkbox-field register-checkbox-field--compact register-field--full">
+            <Checkbox
+              :model-value="provider.use_proxy"
+              :disabled="disabled"
+              @update:model-value="value => emit('update-field', index, 'use_proxy', Boolean(value))"
+            >
+              使用注册代理
+            </Checkbox>
+          </label>
+
+          <div class="register-field register-field--full">
+            <p class="text-xs leading-5 text-muted-foreground">
+              从 outlookEmail 实例领取未注册账号：注册成功后自动给账号打上"成功标签"（默认 gpt），后续领取会跳过已打标签的账号。Web 登录密码仅用于打标签，缺失时只影响远端标签，不影响注册。
+            </p>
+          </div>
+        </template>
+
         <div v-if="currentType === 'icloud_local'" class="register-field register-field--full">
           <p class="text-xs leading-5 text-muted-foreground">使用当前系统的 iCloud 邮箱模块，不需要填写 API 地址、API Key 或邮箱域名。</p>
         </div>
