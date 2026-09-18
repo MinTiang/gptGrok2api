@@ -541,7 +541,7 @@ class ChatGPTWebRegistrarTest(unittest.TestCase):
 
         self.assertEqual(result, callback_url)
 
-    def test_worker_defaults_to_platform_registrar(self) -> None:
+    def test_worker_defaults_to_web_registrar(self) -> None:
         fake_registrar = MagicMock()
         fake_registrar.register.return_value = {
             "email": "registered@example.test",
@@ -552,7 +552,7 @@ class ChatGPTWebRegistrarTest(unittest.TestCase):
         openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
         try:
             with (
-                patch.object(openai_register, "PlatformRegistrar", return_value=fake_registrar) as registrar_type,
+                patch.object(openai_register, "ChatGPTWebRegistrar", return_value=fake_registrar) as registrar_type,
                 patch.object(openai_register.account_service, "add_account_items"),
                 patch.object(openai_register.account_service, "refresh_accounts", return_value={"errors": []}),
                 patch.object(openai_register, "_checkout_config", return_value={"enabled": False}),
@@ -1042,6 +1042,29 @@ class TraditionalChatGPTRegistrarTest(unittest.TestCase):
         mark_mailbox_result.assert_called_once_with(mailbox, success=True)
 
 
+class RegistrarFlowTest(unittest.TestCase):
+    def setUp(self) -> None:
+        openai_register.config.pop("register_flow", None)
+
+    def tearDown(self) -> None:
+        openai_register.config.pop("register_flow", None)
+
+    def test_defaults_to_web_registrar(self) -> None:
+        with patch.object(openai_register, "ChatGPTWebRegistrar", return_value=MagicMock()) as web:
+            registrar = openai_register._create_registrar("proxy-1")
+
+        web.assert_called_once_with("proxy-1")
+        self.assertIs(registrar, web.return_value)
+
+    def test_platform_flow_fallback_is_honored(self) -> None:
+        openai_register.config["register_flow"] = "platform"
+        with patch.object(openai_register, "PlatformRegistrar", return_value=MagicMock()) as platform:
+            registrar = openai_register._create_registrar("proxy-1")
+
+        platform.assert_called_once_with("proxy-1")
+        self.assertIs(registrar, platform.return_value)
+
+
 class OpenAIExistingEmailRetryTest(unittest.TestCase):
     def setUp(self) -> None:
         openai_register._provider_delivery_exclusion.clear()
@@ -1061,7 +1084,7 @@ class OpenAIExistingEmailRetryTest(unittest.TestCase):
 
         with (
             patch.object(openai_register, "_enabled_mail_provider_count", return_value=1),
-            patch.object(openai_register, "PlatformRegistrar", return_value=failed) as factory,
+            patch.object(openai_register, "ChatGPTWebRegistrar", return_value=failed) as factory,
             patch.object(openai_register, "step"),
             self.assertRaisesRegex(RuntimeError, "所有启用邮箱来源均未收到 ChatGPT 验证码"),
         ):
@@ -1084,7 +1107,7 @@ class OpenAIExistingEmailRetryTest(unittest.TestCase):
 
         with (
             patch.object(openai_register, "_enabled_mail_provider_count", return_value=2),
-            patch.object(openai_register, "PlatformRegistrar", side_effect=[failed, fresh]),
+            patch.object(openai_register, "ChatGPTWebRegistrar", side_effect=[failed, fresh]),
             patch.object(openai_register, "step") as step,
         ):
             registrar, result = openai_register._register_with_fresh_email(3)
@@ -1109,7 +1132,7 @@ class OpenAIExistingEmailRetryTest(unittest.TestCase):
         with (
             patch.object(openai_register, "_enabled_mail_provider_count", return_value=2),
             patch.object(openai_register, "mailbox_exclusions_for_new_task", return_value=set(excluded)),
-            patch.object(openai_register, "PlatformRegistrar", return_value=fresh) as factory,
+            patch.object(openai_register, "ChatGPTWebRegistrar", return_value=fresh) as factory,
             patch.object(openai_register, "step") as step,
         ):
             registrar, _result = openai_register._register_with_fresh_email(3)
@@ -1148,7 +1171,7 @@ class OpenAIExistingEmailRetryTest(unittest.TestCase):
 
         with (
             patch.object(openai_register, "_enabled_mail_provider_count", return_value=2),
-            patch.object(openai_register, "PlatformRegistrar", side_effect=[failed, fresh]),
+            patch.object(openai_register, "ChatGPTWebRegistrar", side_effect=[failed, fresh]),
             patch.object(openai_register, "step") as step,
             patch.object(openai_register.time, "sleep") as sleep,
         ):
@@ -1167,7 +1190,7 @@ class OpenAIExistingEmailRetryTest(unittest.TestCase):
         fresh.register.return_value = {"email": "fresh@example.test", "access_token": "access"}
 
         with (
-            patch.object(openai_register, "PlatformRegistrar", side_effect=[existing, fresh]) as factory,
+            patch.object(openai_register, "ChatGPTWebRegistrar", side_effect=[existing, fresh]) as factory,
             patch.object(openai_register, "step") as step,
         ):
             registrar, result = openai_register._register_with_fresh_email(3)
@@ -1189,7 +1212,7 @@ class OpenAIExistingEmailRetryTest(unittest.TestCase):
         fresh.register.return_value = {"email": "fresh@example.test", "access_token": "access"}
 
         with (
-            patch.object(openai_register, "PlatformRegistrar", side_effect=[deactivated, fresh]),
+            patch.object(openai_register, "ChatGPTWebRegistrar", side_effect=[deactivated, fresh]),
             patch.object(openai_register, "step") as step,
         ):
             registrar, result = openai_register._register_with_fresh_email(3)
@@ -1209,7 +1232,7 @@ class OpenAIExistingEmailRetryTest(unittest.TestCase):
 
         with (
             patch.object(openai_register, "OPENAI_EXISTING_EMAIL_RETRY_LIMIT", 2),
-            patch.object(openai_register, "PlatformRegistrar", side_effect=registrars),
+            patch.object(openai_register, "ChatGPTWebRegistrar", side_effect=registrars),
             patch.object(openai_register, "step"),
             self.assertRaisesRegex(RuntimeError, "连续 2 个邮箱不可用于 GPT 新注册"),
         ):
@@ -1364,7 +1387,7 @@ class RegistrationCheckoutWorkerTest(unittest.TestCase):
             }
 
         with (
-            patch.object(openai_register, "PlatformRegistrar", return_value=registrar),
+            patch.object(openai_register, "ChatGPTWebRegistrar", return_value=registrar),
             patch.object(openai_register.account_service, "add_account_items", side_effect=save_account),
             patch.object(openai_register.sub2api_config, "get_server", return_value=server) as get_server,
             patch.object(openai_register, "sync_openai_account", side_effect=sync_account) as sync,
@@ -1453,7 +1476,7 @@ class RegistrationCheckoutWorkerTest(unittest.TestCase):
             raise RuntimeError("remote rejected chatgpt-refresh-secret")
 
         with (
-            patch.object(openai_register, "PlatformRegistrar", return_value=registrar),
+            patch.object(openai_register, "ChatGPTWebRegistrar", return_value=registrar),
             patch.object(openai_register.account_service, "add_account_items", side_effect=save_account),
             patch.object(openai_register.sub2api_config, "get_server", return_value=server),
             patch.object(openai_register, "sync_openai_account", side_effect=fail_sync),
@@ -1501,7 +1524,7 @@ class RegistrationCheckoutWorkerTest(unittest.TestCase):
             }
 
         with (
-            patch.object(openai_register, "PlatformRegistrar", return_value=registrar),
+            patch.object(openai_register, "ChatGPTWebRegistrar", return_value=registrar),
             patch.object(openai_register.account_service, "add_account_items", side_effect=save_account),
             patch.object(openai_register.cpa_config, "get_pool", return_value=pool) as get_pool,
             patch.object(openai_register, "upload_openai_oauth_file", side_effect=upload_account) as upload,
@@ -1554,7 +1577,7 @@ class RegistrationCheckoutWorkerTest(unittest.TestCase):
         pool = {"id": "cpa-primary", "name": "主 CPA", "base_url": "https://cpa.example.test"}
 
         with (
-            patch.object(openai_register, "PlatformRegistrar", return_value=registrar),
+            patch.object(openai_register, "ChatGPTWebRegistrar", return_value=registrar),
             patch.object(openai_register.account_service, "add_account_items"),
             patch.object(openai_register.cpa_config, "get_pool", return_value=pool),
             patch.object(
@@ -1595,7 +1618,7 @@ class RegistrationCheckoutWorkerTest(unittest.TestCase):
             return checkout_result
 
         with (
-            patch.object(openai_register, "PlatformRegistrar", return_value=registrar),
+            patch.object(openai_register, "ChatGPTWebRegistrar", return_value=registrar),
             patch.object(openai_register.account_service, "add_account_items", side_effect=save_account) as add_account,
             patch.object(
                 openai_register.openai_checkout_service,
@@ -1642,7 +1665,7 @@ class RegistrationCheckoutWorkerTest(unittest.TestCase):
             "source_type": "chatgpt_web",
         }
         with (
-            patch.object(openai_register, "PlatformRegistrar", return_value=registrar),
+            patch.object(openai_register, "ChatGPTWebRegistrar", return_value=registrar),
             patch.object(openai_register.account_service, "add_account_items"),
             patch.object(
                 openai_register.openai_checkout_service,
@@ -1685,7 +1708,7 @@ class RegistrationCheckoutWorkerTest(unittest.TestCase):
             "source_type": "chatgpt_web",
         }
         with (
-            patch.object(openai_register, "PlatformRegistrar", return_value=registrar),
+            patch.object(openai_register, "ChatGPTWebRegistrar", return_value=registrar),
             patch.object(openai_register.account_service, "add_account_items"),
             patch.object(openai_register.account_service, "update_account") as update_account,
             patch.object(
@@ -1741,7 +1764,7 @@ class RegistrationCheckoutWorkerTest(unittest.TestCase):
             "source_type": "chatgpt_web",
         }
         with (
-            patch.object(openai_register, "PlatformRegistrar", return_value=registrar),
+            patch.object(openai_register, "ChatGPTWebRegistrar", return_value=registrar),
             patch.object(openai_register.account_service, "add_account_items"),
             patch.object(openai_register.account_service, "update_account") as update_account,
             patch.object(

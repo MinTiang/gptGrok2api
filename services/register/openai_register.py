@@ -3133,6 +3133,22 @@ def mailbox_exclusions_for_new_task() -> set[str]:
     return excluded
 
 
+def _create_registrar(proxy: str) -> "PlatformRegistrar":
+    """默认走消费者网页注册流（与真机抓包一致的身份特征）。
+
+    ChatGPTWebRegistrar 走 chatgpt.com NextAuth 网页流，注册后的第一个
+    会话是正常网页会话；PlatformRegistrar 直连 auth 域并用开发者 OAuth
+    client 换 token，所有账号共享这个可被风控识别的签名，仅作为
+    register_flow=platform 时的回退。下游需要平台凭据（Sub2API/CPA）时
+    由 _sub2api_sync_account_payload 调 extract_platform_oauth_credentials
+    按需补取，无需在注册会话里预取。
+    """
+    flow = str(config.get("register_flow") or "web").strip().lower()
+    if flow == "platform":
+        return PlatformRegistrar(proxy)
+    return ChatGPTWebRegistrar(proxy)
+
+
 def _register_with_fresh_email(index: int) -> tuple[PlatformRegistrar, dict]:
     skipped = 0
     delivery_failures = 0
@@ -3148,7 +3164,7 @@ def _register_with_fresh_email(index: int) -> tuple[PlatformRegistrar, dict]:
         stop_event = config.get("_stop_event")
         if stop_event is not None and stop_event.is_set():
             raise RuntimeError("注册任务已停止")
-        registrar = PlatformRegistrar(config["proxy"])
+        registrar = _create_registrar(config["proxy"])
         registrar.excluded_mail_provider_refs = set(excluded_provider_refs)
         try:
             return registrar, registrar.register(index)
